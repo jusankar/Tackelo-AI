@@ -116,37 +116,55 @@ export default function App() {
     contextRef.current = { resumeFile, jdFile, preparedDocs };
   }, [resumeFile, jdFile, preparedDocs]);
 
-  // Web Audio, MediaRecorder, Hidden Media Sink & SpeechRecognition Refs
+  // Web Audio, MediaRecorder & Hidden Media Sink Refs (Strictly Incoming Stream Only - No Laptop Mic)
   const mediaStreamRef = useRef<MediaStream | null>(null);
   const hiddenVideoSinkRef = useRef<HTMLVideoElement | null>(null);
   const audioContextRef = useRef<AudioContext | null>(null);
   const mediaRecorderRef = useRef<MediaRecorder | null>(null);
   const vadIntervalRef = useRef<number | null>(null);
-  const recognitionRef = useRef<any>(null);
   const isListeningRef = useRef<boolean>(false);
   isListeningRef.current = isListening;
 
-  // Deduplication ref so hybrid speech + audio capture never answers the same question twice
+  const transcriptLogRef = useRef<QnAItem[]>([]);
+  useEffect(() => {
+    transcriptLogRef.current = transcriptLog;
+  }, [transcriptLog]);
+
+  // Deduplication ref so incoming audio capture never answers the same question twice
   const lastQuestionRef = useRef<{ text: string; time: number }>({ text: '', time: 0 });
   const hadSpeechInSegmentRef = useRef<boolean>(false);
 
-  // Enumerate audio input devices (e.g. Stereo Mix, VB-Audio Virtual Cable)
+  const isVirtualLoopbackLabel = (label: string): boolean =>
+    /stereo mix|vb-audio|cable|loopback|what u hear|wave out|blackhole|soundflower|virtual audio/i.test(
+      label
+    );
+
+  const isPhysicalMicLabel = (label: string): boolean => {
+    if (!label) return false;
+    if (isVirtualLoopbackLabel(label)) return false;
+    return /microphone|internal mic|built-in|macbook|headset|airpods|earpods|webcam|usb mic|array/i.test(
+      label
+    );
+  };
+
+  // Enumerate virtual loopback audio devices (e.g. Stereo Mix, VB-Audio Virtual Cable, BlackHole)
+  // Never auto-select the built-in laptop microphone
   const refreshAudioDevices = async () => {
     try {
       if (!navigator.mediaDevices?.enumerateDevices) return;
       const devices = await navigator.mediaDevices.enumerateDevices();
-      const inputs = devices.filter((d) => d.kind === 'audioinput');
+      const inputs = devices.filter(
+        (d) =>
+          d.kind === 'audioinput' &&
+          d.deviceId !== 'default' &&
+          d.deviceId !== 'communications' &&
+          !isPhysicalMicLabel(d.label)
+      );
       setAudioDevices(inputs);
 
-      const loopback = inputs.find((d) =>
-        /stereo mix|vb-audio|cable|loopback|what u hear|wave out|blackhole|soundflower/i.test(
-          d.label
-        )
-      );
+      const loopback = inputs.find((d) => isVirtualLoopbackLabel(d.label));
       if (loopback && !selectedDeviceId) {
         setSelectedDeviceId(loopback.deviceId);
-      } else if (inputs.length > 0 && !selectedDeviceId) {
-        setSelectedDeviceId(inputs[0].deviceId);
       }
     } catch {
       // Ignore device enumeration errors prior to permission grant
@@ -199,13 +217,51 @@ export default function App() {
     return questionOrPromptPattern.test(lower);
   };
 
+  const isEchoOfGeneratedAnswer = (rawText: string): boolean => {
+    const recentItems = transcriptLogRef.current.slice(0, 5);
+    if (recentItems.length === 0) return false;
+
+    const spokenWords = rawText
+      .toLowerCase()
+      .replace(/[^a-z0-9\s]/g, ' ')
+      .split(/\s+/)
+      .filter((w) => w.length > 2);
+    if (spokenWords.length === 0) return false;
+
+    const normSpoken = spokenWords.join(' ');
+
+    for (const item of recentItems) {
+      if (!item.spokenAnswer) continue;
+      const answerLower = item.spokenAnswer
+        .toLowerCase()
+        .replace(/[^a-z0-9\s]/g, ' ')
+        .replace(/\s+/g, ' ')
+        .trim();
+
+      if (normSpoken.length >= 15 && answerLower.includes(normSpoken)) {
+        return true;
+      }
+
+      const answerWordSet = new Set(answerLower.split(' ').filter((w) => w.length > 3));
+      const LongSpokenWords = spokenWords.filter((w) => w.length > 3);
+      if (LongSpokenWords.length >= 4) {
+        const matched = LongSpokenWords.filter((w) => answerWordSet.has(w)).length;
+        if (matched / LongSpokenWords.length >= 0.65) {
+          return true;
+        }
+      }
+    }
+    return false;
+  };
+
   const processSpokenQuestion = async (text: string, isManual: boolean = false) => {
     const cleanQuestion = text.trim();
     if (!cleanQuestion) return;
 
-    // For automatic voice triggers, strictly allow only genuine spoken questions or interview prompts
-    if (!isManual && !isGenuineVoiceQuestion(cleanQuestion)) {
-      return;
+    // For automatic voice triggers, strictly allow only genuine spoken questions and reject any echo of answers being read aloud
+    if (!isManual) {
+      if (!isGenuineVoiceQuestion(cleanQuestion)) return;
+      if (isEchoOfGeneratedAnswer(cleanQuestion)) return;
     }
 
     // Deduplicate if the exact same or overlapping question was triggered within the last 8 seconds
@@ -405,71 +461,51 @@ export default function App() {
     reader.readAsDataURL(blob);
   };
 
-  // Start Web Speech recognition ONLY as a fallback if MediaStream capture is unavailable
-  const startParallelSpeechRecognition = () => {
-    const SpeechRecognitionAPI =
-      (window as any).SpeechRecognition || (window as any).webkitSpeechRecognition;
-    if (!SpeechRecognitionAPI) return;
-
-    try {
-      const recognition = new SpeechRecognitionAPI();
-      recognition.continuous = true;
-      recognition.interimResults = true;
-      recognition.lang = 'en-US';
-
-      recognition.onresult = (event: any) => {
-        let interim = '';
-        let final = '';
-        for (let i = event.resultIndex; i < event.results.length; ++i) {
-          if (event.results[i].isFinal) {
-            final += event.results[i][0].transcript;
-          } else {
-            interim += event.results[i][0].transcript;
-          }
-        }
-        const currentText = final || interim;
-        setLiveTranscriptBuffer(currentText);
-
-        if (final && final.trim().length > 3) {
-          setLiveTranscriptBuffer('');
-          processSpokenQuestionRef.current(final.trim(), false);
-        }
-      };
-
-      recognition.onend = () => {
-        if (isListeningRef.current && recognitionRef.current === recognition) {
-          try {
-            recognition.start();
-          } catch {}
-        }
-      };
-
-      recognition.start();
-      recognitionRef.current = recognition;
-    } catch {}
-  };
-
-  // Fallback helper: start loopback device audio capture (without turning on default laptop mic SpeechRecognition at the same time)
-  const startLoopbackOrSpeechFallback = async (reasonMsg?: string) => {
+  // Capture strictly from a virtual loopback cable (Stereo Mix / VB-Cable / BlackHole) — NEVER from the physical laptop microphone
+  const startVirtualLoopbackCapture = async () => {
     try {
       const devices = await navigator.mediaDevices.enumerateDevices();
-      const inputs = devices.filter((d) => d.kind === 'audioinput');
-      const loopback = inputs.find((d) =>
-        /stereo mix|vb-audio|cable|loopback|what u hear|wave out|blackhole|soundflower/i.test(
-          d.label
-        )
+      const inputs = devices.filter(
+        (d) =>
+          d.kind === 'audioinput' &&
+          d.deviceId !== 'default' &&
+          d.deviceId !== 'communications' &&
+          !isPhysicalMicLabel(d.label)
       );
+      setAudioDevices(inputs);
+
+      const loopback = inputs.find((d) => isVirtualLoopbackLabel(d.label));
       const targetDeviceId = selectedDeviceId || loopback?.deviceId;
+
+      if (!targetDeviceId) {
+        setIsListening(false);
+        setAudioStatusMsg(
+          'No Virtual Loopback cable (Stereo Mix / VB-Cable / BlackHole) detected. Switch to "System / Meeting Audio" so your laptop mic is never used.'
+        );
+        return false;
+      }
 
       const stream = await navigator.mediaDevices.getUserMedia({
         audio: {
-          deviceId: targetDeviceId ? { ideal: targetDeviceId } : undefined,
+          deviceId: { exact: targetDeviceId },
           echoCancellation: false,
-          noiseSuppression: true,
-          autoGainControl: true,
+          noiseSuppression: false,
+          autoGainControl: false,
         },
         video: false,
       });
+
+      // Double-check the track label after permission grant to guarantee it is NOT a physical laptop microphone
+      const trackLabel = stream.getAudioTracks()[0]?.label || '';
+      if (isPhysicalMicLabel(trackLabel)) {
+        stream.getTracks().forEach((t) => t.stop());
+        await refreshAudioDevices();
+        setIsListening(false);
+        setAudioStatusMsg(
+          `Blocked "${trackLabel}" because it is a microphone. Please select a Virtual Loopback device (Stereo Mix / VB-Cable) or use "System / Meeting Audio" so your own voice and room noise are never captured.`
+        );
+        return false;
+      }
 
       await refreshAudioDevices();
       mediaStreamRef.current = stream;
@@ -477,33 +513,34 @@ export default function App() {
       setIsListening(true);
       setActiveTab('copilot');
       setAudioStatusMsg(
-        reasonMsg ||
-          'Listening via Loopback / Audio Input stream (Only real voice questions will be answered)...'
+        `Capturing Incoming Loopback Stream (${trackLabel || 'Virtual Cable'}) — Laptop Mic Disabled.`
       );
       return true;
     } catch {
-      startParallelSpeechRecognition();
-      if (recognitionRef.current) {
-        setIsListening(true);
-        setActiveTab('copilot');
-        setAudioStatusMsg('Live speech listener active — listening for interviewer questions...');
-        return true;
-      }
-      setAudioStatusMsg(
-        'Audio permission was declined. Grant audio permission or type/paste questions on the right.'
-      );
       setIsListening(false);
+      setAudioStatusMsg(
+        'Could not open Virtual Loopback device. Use "System / Meeting Audio" and check "Share system/tab audio" (Laptop mic remains disabled).'
+      );
       return false;
     }
   };
 
-  // Start capturing incoming interviewer audio (System/Tab Audio or Virtual Loopback Device)
+  // Start capturing strictly incoming interviewer audio (System/Tab Audio or Virtual Loopback Cable)
+  // NEVER falls back to laptop microphone or SpeechRecognition
   const startIncomingAudioCapture = async () => {
     setAudioStatusMsg('');
 
-    if (captureMode === 'system_audio' && navigator.mediaDevices?.getDisplayMedia) {
+    if (captureMode === 'system_audio') {
+      if (!navigator.mediaDevices?.getDisplayMedia) {
+        setIsListening(false);
+        setAudioStatusMsg(
+          'System/Tab audio capture is not supported in this browser. Please use Chrome or Edge to capture incoming meeting audio.'
+        );
+        return;
+      }
+
       try {
-        // Request system/tab audio with raw fidelity so Zoom/Teams/Meet voice is clear
+        // Request ONLY incoming system/tab audio stream (Zoom/Teams/Meet)
         const fullDisplayStream = await navigator.mediaDevices.getDisplayMedia({
           video: true,
           audio: {
@@ -512,13 +549,17 @@ export default function App() {
             autoGainControl: false,
             suppressLocalAudioPlayback: false,
           } as any,
-        });
+          systemAudio: 'include',
+        } as any);
 
         const audioTracks = fullDisplayStream.getAudioTracks();
         if (audioTracks.length === 0) {
+          // Stop display tracks immediately and do NOT fall back to laptop microphone
           fullDisplayStream.getTracks().forEach((t) => t.stop());
-          await startLoopbackOrSpeechFallback(
-            'Tip: Check "Also share tab/system audio" in the popup next time. Switched to Loopback Audio stream.'
+          setIsListening(false);
+          setActiveTab('copilot');
+          setAudioStatusMsg(
+            'No incoming audio track shared! Click "Start Capturing Interviewer Audio" again and make sure to check "Also share tab/system audio" in the popup (Laptop mic is disabled so your own voice is never picked up).'
           );
           return;
         }
@@ -534,19 +575,21 @@ export default function App() {
         setIsListening(true);
         setActiveTab('copilot');
         setAudioStatusMsg(
-          'Capturing Incoming System / Meeting Audio (Laptop Mic Ignored)...'
+          'Capturing ONLY Incoming System / Meeting Audio (Laptop Mic & Room Noise Completely Ignored).'
         );
         return;
       } catch {
-        setCaptureMode('loopback_device');
-        await startLoopbackOrSpeechFallback(
-          'System screen-share skipped — capturing via Loopback / Audio Input stream.'
+        // User cancelled the screen/audio share prompt — do NOT open laptop microphone
+        setIsListening(false);
+        setActiveTab('copilot');
+        setAudioStatusMsg(
+          'Incoming audio selection cancelled. Click "Start Capturing Interviewer Audio", choose your meeting tab/window, and check "Also share tab/system audio" (Laptop mic stays off).'
         );
         return;
       }
     }
 
-    await startLoopbackOrSpeechFallback();
+    await startVirtualLoopbackCapture();
   };
 
   // Vocal-Bandpass Filtered Voice Activity Detection + Utterance Recorder
@@ -761,12 +804,6 @@ export default function App() {
     if (audioContextRef.current) {
       audioContextRef.current.close().catch(() => {});
       audioContextRef.current = null;
-    }
-    if (recognitionRef.current) {
-      try {
-        recognitionRef.current.stop();
-      } catch {}
-      recognitionRef.current = null;
     }
     setAudioLevel(0);
     setIsSpeakingDetected(false);
@@ -1342,9 +1379,9 @@ export default function App() {
                   Prepared Q&A ({preparedDocs.length} doc{preparedDocs.length === 1 ? '' : 's'})
                 </span>
               </div>
-              <span className="text-indigo-400 font-mono">
-                stream=True · High-Sensitivity Incoming Audio
-              </span>
+                  <span className="text-indigo-400 font-mono">
+                    stream=True · Incoming Stream Only (Laptop Mic Disabled)
+                  </span>
             </div>
 
             {/* Incoming Audio Source & Live Capture Bar */}
