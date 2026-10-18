@@ -1,0 +1,11 @@
+{
+  "name": "Tackelo AI",
+  "description": "Tackelo AI - Real-time AI Interview Copilot with RAG, speech transcription context disambiguation, resume & JD tailoring, and transparent floating window mode.",
+  "requestFramePermissions": [
+    "microphone",
+    "display-capture"
+  ],
+  "majorCapabilities": [
+    "MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"
+  ]
+}
