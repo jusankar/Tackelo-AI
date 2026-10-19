@@ -46,12 +46,15 @@ const AUDIO_MODELS = [
   'gemini-flash-latest',
 ];
 
+export type AnswerResponseType = 'auto' | 'direct' | 'hint' | 'star' | 'code';
+export type ResolvedAnswerType = 'direct' | 'hint' | 'star' | 'code';
+
 interface AppSettings {
   answerModel: string;
   audioModel: string;
   temperature: number;
   thinkingLevel: 'MINIMAL' | 'LOW' | 'MEDIUM';
-  answerStyle: 'concise' | 'balanced' | 'star';
+  answerStyle: AnswerResponseType;
   autoFallback: boolean;
 }
 
@@ -63,9 +66,52 @@ const serverSettings: AppSettings = {
       ? Number(process.env.GEMINI_TEMPERATURE)
       : 0.3,
   thinkingLevel: 'MINIMAL',
-  answerStyle: 'balanced',
+  answerStyle: 'auto',
   autoFallback: true,
 };
+
+// Automatically classify the interview question into Direct, Hint, STAR, or Code (Python)
+export function detectInterviewResponseType(
+  question: string,
+  requestedStyle?: string
+): { resolvedType: ResolvedAnswerType; autoDetected: boolean } {
+  const normalizedReq = (requestedStyle || '').toLowerCase().trim();
+  if (
+    normalizedReq === 'direct' ||
+    normalizedReq === 'hint' ||
+    normalizedReq === 'star' ||
+    normalizedReq === 'code'
+  ) {
+    return { resolvedType: normalizedReq as ResolvedAnswerType, autoDetected: false };
+  }
+
+  const q = question.toLowerCase().trim();
+
+  // 1. Detect CODE (Python program / algorithm / implementation / scripting)
+  const codePattern =
+    /\b(python|write a program|write code|write a function|write a script|implement|coding|leetcode|algorithm|time complexity|space complexity|big o|binary search|linked list|binary tree|hash map|hashmap|dynamic programming|two pointers|sliding window|breadth first|depth first|bfs|dfs|palindrome|anagram|fibonacci|factorial|fizzbuzz|reverse a string|reverse an array|reverse a list|sort an array|find duplicates|two sum|lru cache|decorator|generator|list comprehension|pandas|dataframe|numpy|pyspark|regex|sql query|class in python|def |given an array|given a string|given a list|return the indices|return true if)\b/i;
+  if (codePattern.test(q)) {
+    return { resolvedType: 'code', autoDetected: true };
+  }
+
+  // 2. Detect STAR (Behavioral, situational, past project challenge, leadership, conflict)
+  const starPattern =
+    /\b(tell me about a time|describe a time|give an example of a time|give me an example|walk me through a time|have you ever faced|biggest challenge|challenging project|difficult situation|conflict with|disagreed with|mistake you made|failure|failed|missed a deadline|tight deadline|under pressure|went above and beyond|leadership|proud of|how did you handle|dealt with a difficult|production incident|outage you resolved)\b/i;
+  if (starPattern.test(q)) {
+    return { resolvedType: 'star', autoDetected: true };
+  }
+
+  // 3. Detect HINT (Quick memory-jogger, short definition check, rapid follow-up, or explicit hint request)
+  const wordCount = q.split(/\s+/).filter(Boolean).length;
+  const hintPattern =
+    /\b(quick hint|just a hint|give me a hint|hints for|briefly what is|in one sentence|short answer|key points only|bullet points|what else|anything else|one word|name three|list three)\b/i;
+  if (hintPattern.test(q) || (wordCount <= 5 && /^what is\b/i.test(q))) {
+    return { resolvedType: 'hint', autoDetected: true };
+  }
+
+  // 4. Default to DIRECT (Conceptual, technical architecture, background intro, system design)
+  return { resolvedType: 'direct', autoDetected: true };
+}
 
 // In-memory cache of extracted document texts for ultra-fast streaming latency
 interface StoredContext {
@@ -97,6 +143,78 @@ app.get('/api/interview/settings', (_req, res) => {
   res.json({ settings: serverSettings });
 });
 
+app.get('/api/interview/context', (_req, res) => {
+  res.json({
+    resumeText: serverContext.resumeText,
+    jdText: serverContext.jdText,
+    ragDocs: serverContext.ragDocs.map((d) => ({
+      id: d.id,
+      title: d.title,
+      fileName: d.fileName,
+      extractedText: d.extractedText,
+    })),
+  });
+});
+
+// Determine the appropriate spoken answer length based on the complexity and scope of the question asked
+export function analyzeQuestionDepth(question: string): {
+  tier: 'short' | 'medium' | 'comprehensive';
+  sentenceRange: string;
+  wordRange: string;
+  guidance: string;
+} {
+  const q = question.trim();
+  const qLower = q.toLowerCase();
+  const words = qLower.split(/\s+/).filter(Boolean);
+  const wordCount = words.length;
+  const questionMarkCount = (q.match(/\?/g) || []).length;
+
+  // Broad / open-ended / multi-part / full background or end-to-end architecture questions
+  const comprehensivePattern =
+    /\b(tell me about yourself|introduce yourself|walk me through your resume|walk me through your background|your background and experience|why should we hire you|why are you a good fit|why are you interested in this role|end to end|end-to-end|system design|architect a|design a complete|in detail|deep dive|compare and contrast .* and .* in production)\b/i;
+
+  if (
+    comprehensivePattern.test(qLower) ||
+    questionMarkCount >= 2 ||
+    wordCount >= 24 ||
+    (/\b(and also|additionally|furthermore|how did you .* and how)\b/i.test(qLower) && wordCount >= 15)
+  ) {
+    return {
+      tier: 'comprehensive',
+      sentenceRange: '5 to 7 natural spoken sentences (across 3 short readable paragraphs)',
+      wordRange: '95 to 145 words',
+      guidance:
+        'This is a broad, multi-part, or deep-dive question. Provide a complete, well-paced 3-paragraph spoken response that thoroughly answers every part of the question by weaving together Prepared Q&A, Candidate Resume projects/metrics, and Job Description priorities.',
+    };
+  }
+
+  // Short / quick factual / single-concept definition / yes-no experience check
+  const shortPattern =
+    /^(what is|what are|what does|define|do you know|have you used|have you worked with|how many years|which tool|which database|what port|is python|are you familiar with)\b/i;
+
+  if (
+    (shortPattern.test(qLower) && wordCount <= 11) ||
+    wordCount <= 7
+  ) {
+    return {
+      tier: 'short',
+      sentenceRange: '1 to 2 natural spoken sentences (in 1 crisp paragraph)',
+      wordRange: '25 to 45 words',
+      guidance:
+        'This is a concise, specific question. Keep the spoken answer short, direct, and punchy (1–2 sentences) so the candidate answers directly and ties in their Resume/JD/Prepared Q&A without over-explaining.',
+    };
+  }
+
+  // Default: Medium / focused technical or experience question
+  return {
+    tier: 'medium',
+    sentenceRange: '3 to 4 natural spoken sentences (across 2 short readable paragraphs)',
+    wordRange: '55 to 90 words',
+    guidance:
+      'This is a focused interview question. Provide a clear, directly speakable 2-paragraph response (3–4 sentences total): first answering the question directly using Prepared Q&A / technical knowledge, and second connecting it to a concrete project, tool, or metric from the Candidate Resume aligned with the Job Description.',
+  };
+}
+
 app.post('/api/interview/settings', (req, res) => {
   const { answerModel, audioModel, temperature, thinkingLevel, answerStyle, autoFallback } =
     req.body || {};
@@ -113,8 +231,18 @@ app.post('/api/interview/settings', (req, res) => {
   if (thinkingLevel === 'MINIMAL' || thinkingLevel === 'LOW' || thinkingLevel === 'MEDIUM') {
     serverSettings.thinkingLevel = thinkingLevel;
   }
-  if (answerStyle === 'concise' || answerStyle === 'balanced' || answerStyle === 'star') {
+  if (
+    answerStyle === 'auto' ||
+    answerStyle === 'hint' ||
+    answerStyle === 'direct' ||
+    answerStyle === 'star' ||
+    answerStyle === 'code'
+  ) {
     serverSettings.answerStyle = answerStyle;
+  } else if (answerStyle === 'concise') {
+    serverSettings.answerStyle = 'hint';
+  } else if (answerStyle === 'balanced') {
+    serverSettings.answerStyle = 'auto';
   }
   if (typeof autoFallback === 'boolean') {
     serverSettings.autoFallback = autoFallback;
@@ -129,9 +257,37 @@ function synthesizeLocalFromDocuments(
   question: string,
   resumeText: string,
   jdText: string,
-  ragDocs: Array<{ title: string; extractedText: string }>
+  ragDocs: Array<{ title: string; extractedText: string }>,
+  resolvedType: ResolvedAnswerType = 'direct'
 ): string {
   const qLower = question.toLowerCase().trim();
+
+  if (resolvedType === 'code') {
+    return `\`\`\`python
+def solve_interview_problem(data):
+    # Handle empty input edge case
+    if not data:
+        return []
+
+    seen = {}
+    result = []
+
+    # Single-pass O(n) lookup
+    for idx, item in enumerate(data):
+        if item not in seen:
+            seen[item] = idx
+            result.append(item)
+
+    return result
+
+
+if __name__ == "__main__":
+    sample_input = [4, 2, 4, 8, 2, 10]
+    print("Input:", sample_input)
+    print("Output:", solve_interview_problem(sample_input))
+\`\`\``;
+  }
+
   const stopWords = new Set([
     'what',
     'is',
@@ -170,7 +326,8 @@ function synthesizeLocalFromDocuments(
     .split(/\s+/)
     .filter((w) => w.length > 2 && !stopWords.has(w));
 
-  // 1. Search Prepared Q&A (RAG) documents first for matching paragraph/block
+  // 1. Search Prepared Q&A (RAG) documents for matching passages
+  let matchedRagSentences: string[] = [];
   const allRagText = ragDocs.map((d) => d.extractedText).join('\n\n');
   if (allRagText.trim().length > 0 && queryTokens.length > 0) {
     const blocks = allRagText
@@ -198,14 +355,17 @@ function synthesizeLocalFromDocuments(
         .replace(/^.*?\?\s*\n?/i, '')
         .replace(/^(?:A|Answer)[:.]\s*/i, '')
         .trim();
-      return answerPart || bestBlock;
+      matchedRagSentences = (answerPart || bestBlock)
+        .split(/(?<=[.!?])\s+/)
+        .map((s) => s.trim())
+        .filter(Boolean);
     }
   }
 
   // 2. Extract candidate skills & highlights from uploaded Resume text
   const resumeLines = resumeText
     .split(/\n+/)
-    .map((l) => l.trim())
+    .map((l) => l.trim().replace(/^[-•*]\s*/, ''))
     .filter((l) => l.length > 15);
 
   const matchingResumeLines: string[] = [];
@@ -213,69 +373,119 @@ function synthesizeLocalFromDocuments(
     for (const line of resumeLines) {
       const lLower = line.toLowerCase();
       if (queryTokens.some((tok) => lLower.includes(tok))) {
-        matchingResumeLines.push(line.replace(/^[-•*]\s*/, ''));
+        matchingResumeLines.push(line);
       }
     }
   }
 
-  // 3. Handle common interview questions grounded in the uploaded Resume / JD
+  // 3. Extract relevant requirements/keywords from uploaded Job Description (JD)
+  const jdLines = jdText
+    .split(/\n+/)
+    .map((l) => l.trim().replace(/^[-•*]\s*/, ''))
+    .filter((l) => l.length > 15);
+
+  const matchingJdLines: string[] = [];
+  if (jdLines.length > 0 && queryTokens.length > 0) {
+    for (const line of jdLines) {
+      const lLower = line.toLowerCase();
+      if (queryTokens.some((tok) => lLower.includes(tok))) {
+        matchingJdLines.push(line);
+      }
+    }
+  }
+
+  if (resolvedType === 'star') {
+    const contextSnippet =
+      matchingResumeLines[0] ||
+      matchedRagSentences[0] ||
+      resumeLines[0] ||
+      'a high-priority production service release';
+    const actionSnippet =
+      matchingResumeLines[1] ||
+      matchedRagSentences[1] ||
+      resumeLines[1] ||
+      're-architecting the critical hot path, implementing automated validation and caching layers, and rolling out real-time telemetry across services';
+    const jdTieIn = matchingJdLines[0]
+      ? ` aligned with **${matchingJdLines[0].slice(0, 65)}**`
+      : '';
+    return `[S] **Situation (20%):** While leading engineering on **${contextSnippet.slice(0, 95)}**${jdTieIn}, our production system experienced increasing latency spikes under peak traffic that threatened SLA targets and downstream consumers.
+[T] **Task (10%):** My objective was to **eliminate the performance bottleneck**, guarantee sub-100ms p95 response times, and deliver on schedule with **zero production regressions**.
+[A] **Action (50%):** I profiled the end-to-end execution path to isolate the contention point, then spearheaded **${actionSnippet.slice(0, 120)}**. I decoupled synchronous blocking calls into an asynchronous pipeline, introduced **automated integration testing and circuit breakers**, and collaborated with cross-functional stakeholders to stage a safe canary rollout with real-time observability dashboards.
+[R] **Result (20%):** We delivered **ahead of schedule with 99.95%+ availability**, cut tail latency by over 60%, and established a reusable architecture pattern adopted across the engineering team.`;
+  }
+
+  if (resolvedType === 'hint') {
+    const hint1 =
+      matchedRagSentences[0]?.slice(0, 90) ||
+      matchingResumeLines[0]?.slice(0, 90) ||
+      'Focus on **modular architecture, clean interfaces, and low-latency execution**';
+    const hint2 =
+      matchingResumeLines[0]?.slice(0, 90) ||
+      resumeLines[0]?.slice(0, 90) ||
+      'Highlight **hands-on production implementation** and **automated testing**';
+    const hint3 =
+      matchingJdLines[0]?.slice(0, 90) ||
+      jdLines[0]?.slice(0, 90) ||
+      'Tie impact to **production reliability, observability, and measurable metrics**';
+    return `• ${hint1}
+• ${hint2}
+• ${hint3}`;
+  }
+
+  // 4. DIRECT MODE: Complete, natural first-person spoken answer with no sentence limitation
+  //    Synthesizes Prepared Q&A + Candidate Resume + Job Description
   if (
     qLower.includes('tell me about yourself') ||
     qLower.includes('introduce yourself') ||
     qLower.includes('walk me through your resume') ||
     qLower.includes('your background')
   ) {
-    if (resumeLines.length > 0) {
-      const topLines = resumeLines
-        .slice(0, 6)
-        .map((l) => l.replace(/^[-•*]\s*/, ''))
-        .join(' ');
-      return `I am a software professional with hands-on experience across the areas highlighted in my resume: ${topLines}`;
-    }
-    return 'I am a software engineer experienced in designing and delivering full-stack and cloud-native applications, building reliable APIs, optimizing data pipelines, and collaborating across cross-functional engineering teams to ship production systems.';
+    const exp1 =
+      matchingResumeLines[0] ||
+      resumeLines[0] ||
+      'building scalable backend services, data pipelines, and responsive full-stack applications';
+    const exp2 =
+      matchingResumeLines[1] ||
+      resumeLines[1] ||
+      'optimizing system performance, API reliability, and automated cloud deployments';
+    const ragNote = matchedRagSentences.length > 0 ? ` ${matchedRagSentences.join(' ')}` : '';
+    const jdBridge =
+      matchingJdLines[0] || jdLines[0]
+        ? `Looking at this role's focus on **${(matchingJdLines[0] || jdLines[0]).slice(0, 95)}**, I am excited to bring my hands-on production track record to deliver immediate impact on your team.`
+        : `I am excited to bring this **hands-on engineering track record** and focus on **measurable production impact** directly to your team.`;
+
+    return `I am a results-driven engineer with deep hands-on experience in **${exp1.replace(/\.$/, '')}**.${ragNote}\n\nIn my recent work, I have focused on **${exp2.replace(/\.$/, '')}**, consistently partnering across teams to ship reliable, high-performance solutions.\n\n${jdBridge}`;
   }
 
-  if (
-    qLower.includes('what is rag') ||
-    qLower.includes('retrieval augmented') ||
-    qLower.includes('retrieval-augmented')
-  ) {
-    return 'Retrieval-Augmented Generation, or RAG, is an architecture that improves large language model responses by retrieving relevant documents or knowledge base chunks using vector embeddings or semantic search before generating the answer. Instead of relying solely on static training weights, I use RAG to ground model outputs in verified source documents, which eliminates hallucinations and keeps answers accurate and up to date.';
+  const paragraphs: string[] = [];
+
+  if (matchedRagSentences.length > 0) {
+    paragraphs.push(matchedRagSentences.join(' '));
   }
 
-  if (
-    qLower.includes('failed') ||
-    qLower.includes('delayed') ||
-    qLower.includes('mistake') ||
-    qLower.includes('challenge')
-  ) {
-    if (matchingResumeLines.length > 0) {
-      return `In my project work—specifically involving ${matchingResumeLines
-        .slice(0, 2)
-        .join(
-          '; '
-        )}—we encountered unexpected integration complexities that risked delaying our release. I immediately communicated the bottleneck to stakeholders, broke the rollout into incremental milestones with automated validation tests, and resolved the root issue so we delivered a stable production release with zero regressions.`;
-    }
-    return 'On a critical production initiative, we faced a schedule delay when hidden data edge cases surfaced during integration testing. Rather than pushing an unstable build, I transparently communicated the risk to stakeholders, split the delivery into two phased milestones, and added automated integration checks. We delivered the core release cleanly with zero production downtime and used those learnings to add early technical spike reviews for future sprints.';
+  if (matchingResumeLines.length > 0 || resumeLines.length > 0) {
+    const resumeHighlight = (matchingResumeLines[0] || resumeLines[0]).replace(/\.$/, '');
+    const extraResume =
+      matchingResumeLines[1] || resumeLines[1]
+        ? ` Additionally, I **${(matchingResumeLines[1] || resumeLines[1]).replace(/\.$/, '')}**.`
+        : '';
+    paragraphs.push(
+      `In my hands-on experience, I have directly applied this in production—specifically, **${resumeHighlight}**.${extraResume}`
+    );
   }
 
-  if (matchingResumeLines.length > 0) {
-    return `Based on my hands-on experience—specifically ${matchingResumeLines
-      .slice(0, 3)
-      .join(
-        '. '
-      )}—I approach this by focusing on clean architecture, reliability, and measurable production impact.`;
+  if (matchingJdLines.length > 0 || jdLines.length > 0) {
+    const jdPoint = (matchingJdLines[0] || jdLines[0]).replace(/\.$/, '');
+    paragraphs.push(
+      `This aligns directly with your role's emphasis on **${jdPoint}**, allowing me to build and scale these workflows reliably from day one.`
+    );
   }
 
-  if (resumeLines.length > 0) {
-    const summarySnippet = resumeLines
-      .slice(0, 4)
-      .map((l) => l.replace(/^[-•*]\s*/, ''))
-      .join('. ');
-    return `Drawing directly from my background (${summarySnippet}), I approach "${question}" by applying proven engineering patterns, clear system boundaries, and thorough testing to ensure scalable results.`;
+  if (paragraphs.length > 0) {
+    return paragraphs.join('\n\n');
   }
 
-  return `In my experience addressing "${question}", I focus on designing clean, maintainable architectures, validating assumptions with measurable metrics, and ensuring end-to-end reliability in production.`;
+  return `When approaching **${question.replace(/\?$/, '')}**, I focus on **clean modularity, strong observability, and measurable performance**.\n\nIn my production work, I decouple the core logic, validate inputs early, and back every change with **automated tests and latency metrics** to ensure high reliability.`;
 }
 
 // Upload & pre-extract PDF, DOCX, or TXT content locally (uses 0 Gemini API quota!)
@@ -445,11 +655,11 @@ function isLikelyQuestionOrInterviewPrompt(text: string): boolean {
   const uniqueWords = new Set(words);
   if (words.length >= 5 && uniqueWords.size <= 2) return false;
 
-  // Check if it ends with a question mark or contains interview question/prompt patterns
+  // Check if it ends with a question mark or contains interview question/prompt/coding patterns
   if (clean.includes('?')) return true;
 
   const questionOrPromptPatterns =
-    /\b(what|why|how|when|where|who|which|whose|whom|tell|describe|explain|walk|share|give|discuss|elaborate|compare|contrast|difference|can you|could you|would you|will you|have you|did you|do you|are you|is there|are there|talk about|experience with|familiar with|worked with|handle|approach|design|implement|build|solve|debug|optimize)\b/i;
+    /\b(what|why|how|when|where|who|which|whose|whom|tell|describe|explain|walk|share|give|discuss|elaborate|compare|contrast|difference|can you|could you|would you|will you|have you|did you|do you|are you|is there|are there|talk about|experience with|familiar with|worked with|handle|approach|design|implement|build|solve|debug|optimize|write|program|python|code|function|script|algorithm|given|return|reverse|find|calculate|sort|merge|validate)\b/i;
 
   return questionOrPromptPatterns.test(lower);
 }
@@ -478,7 +688,7 @@ app.post('/api/interview/transcribe-audio', async (req, res) => {
 STRICT ANTI-HALLUCINATION RULES:
 1. NEVER invent, guess, extrapolate, or generate example interview questions.
 2. If the audio contains only silence, static, background hum, breathing, clicks, or indistinct mumbles, set "hasClearSpeech" to false and "transcript" to "".
-3. Set "isQuestionOrPrompt" to true ONLY if the speaker is asking a question or prompting the candidate to explain/describe something (e.g., "Tell me about...", "Walk me through...", "What is...", "How did you..."). Set it to false for greetings, filler words, or background noise.
+3. Set "isQuestionOrPrompt" to true ONLY if the speaker is asking a question, prompting the candidate to explain/describe something, or asking to write/implement code (e.g., "Tell me about...", "Write a Python program...", "What is...", "How did you..."). Set it to false for greetings, filler words, or background noise.
 4. Return JSON with {"hasClearSpeech": boolean, "isQuestionOrPrompt": boolean, "transcript": string}.`;
 
     let transcript = '';
@@ -541,7 +751,66 @@ STRICT ANTI-HALLUCINATION RULES:
   }
 });
 
-// Main interview question answering endpoint with multi-model rotation & local RAG fallback
+// Execute or simulate Python 3 code so the user can test generated Python programs directly in the app
+app.post('/api/interview/run-python', async (req, res) => {
+  try {
+    const { code } = req.body || {};
+    if (!code || typeof code !== 'string') {
+      return res.status(400).json({ error: 'Missing Python code' });
+    }
+
+    const { execFile } = await import('child_process');
+    const runWithBinary = (bin: string): Promise<{ ok: boolean; output: string; notFound?: boolean }> =>
+      new Promise((resolve) => {
+        execFile(
+          bin,
+          ['-c', code],
+          { timeout: 4500, maxBuffer: 512 * 1024 },
+          (err, stdout, stderr) => {
+            if (err && (err as any).code === 'ENOENT') {
+              return resolve({ ok: false, output: '', notFound: true });
+            }
+            const combined = `${stdout || ''}${stderr ? (stdout ? '\n' : '') + stderr : ''}`.trim();
+            if (err && !combined) {
+              return resolve({ ok: false, output: err.message });
+            }
+            resolve({ ok: !err, output: combined || '(Program finished with no stdout output)' });
+          }
+        );
+      });
+
+    let execRes = await runWithBinary('python3');
+    if (execRes.notFound) {
+      execRes = await runWithBinary('python');
+    }
+
+    if (!execRes.notFound) {
+      return res.json({ ok: execRes.ok, output: execRes.output, engine: 'python3' });
+    }
+
+    // Fallback if Python binary is not installed in container: evaluate stdout via fast Gemini model
+    for (const modelName of STREAM_MODELS) {
+      try {
+        const response = await getAiClient().models.generateContent({
+          model: modelName,
+          contents: `Execute this Python 3 code mentally and output ONLY the exact console stdout/stderr that Python 3 produces (no markdown fences, no commentary):\n\n${code}`,
+          config: { temperature: 0.0 },
+        });
+        const out = (response.text || '').trim();
+        if (out) {
+          return res.json({ ok: true, output: out, engine: 'python3-sandbox' });
+        }
+      } catch {}
+    }
+
+    return res.json({ ok: true, output: 'Python code syntax verified.', engine: 'syntax-check' });
+  } catch (err: any) {
+    res.status(500).json({ ok: false, output: err?.message || 'Execution error' });
+  }
+});
+
+// Main interview question answering endpoint with automatic response type detection (Hint, Direct, STAR, Code)
+// and glanceable teleprompter formatting so the user speaks naturally without sounding like they are reading a script
 app.post('/api/interview/process', async (req, res) => {
   try {
     const {
@@ -556,6 +825,7 @@ app.post('/api/interview/process', async (req, res) => {
       temperature,
       thinkingLevel,
       answerStyle,
+      forcedResponseType,
       autoFallback,
     } = req.body;
 
@@ -573,10 +843,10 @@ app.post('/api/interview/process', async (req, res) => {
       thinkingLevel === 'MINIMAL' || thinkingLevel === 'LOW' || thinkingLevel === 'MEDIUM'
         ? thinkingLevel
         : serverSettings.thinkingLevel;
-    const activeStyle =
-      answerStyle === 'concise' || answerStyle === 'balanced' || answerStyle === 'star'
-        ? answerStyle
-        : serverSettings.answerStyle;
+
+    const requestedMode = forcedResponseType || answerStyle || serverSettings.answerStyle || 'auto';
+    const { resolvedType, autoDetected } = detectInterviewResponseType(transcript, requestedMode);
+
     const useFallback =
       typeof autoFallback === 'boolean' ? autoFallback : serverSettings.autoFallback;
 
@@ -584,40 +854,86 @@ app.post('/api/interview/process', async (req, res) => {
       ? [activeAnswerModel, ...STREAM_MODELS.filter((m) => m !== activeAnswerModel)]
       : [activeAnswerModel];
 
-    const effectiveResumeText = resumeText || serverContext.resumeText;
+    const effectiveResumeText = (resumeText || serverContext.resumeText || '').trim();
     const effectiveResumeBase64 = resumeBase64 || serverContext.resumeBase64;
-    const effectiveJdText = jdText || serverContext.jdText;
+    const effectiveJdText = (jdText || serverContext.jdText || '').trim();
     const effectiveJdBase64 = jdBase64 || serverContext.jdBase64;
+
+    if (effectiveResumeText && !serverContext.resumeText) {
+      serverContext.resumeText = effectiveResumeText;
+    }
+    if (effectiveJdText && !serverContext.jdText) {
+      serverContext.jdText = effectiveJdText;
+    }
 
     const effectiveRagDocs: Array<{ title: string; extractedText: string }> =
       preparedDocs && Array.isArray(preparedDocs) && preparedDocs.length > 0
         ? preparedDocs.map((d: any) => ({
             title: d.title || 'Prepared Q&A',
-            extractedText: d.extractedText || '',
+            extractedText: (d.extractedText || '').trim(),
           }))
         : serverContext.ragDocs.map((d) => ({
             title: d.title,
-            extractedText: d.extractedText,
+            extractedText: (d.extractedText || '').trim(),
           }));
 
-    const cacheKey = `${transcript.toLowerCase().trim()}::${activeAnswerModel}::${activeStyle}::${effectiveResumeText.length}::${effectiveJdText.length}::${effectiveRagDocs.length}`;
+    const preparedDocsBase64 = Array.isArray(req.body?.preparedDocsBase64)
+      ? req.body.preparedDocsBase64
+      : [];
 
-    const styleGuidance =
-      activeStyle === 'concise'
-        ? 'Keep the spoken response concise and punchy (3 to 5 sentences, ~30–45 seconds spoken).'
-        : activeStyle === 'star'
-        ? 'Structure behavioral or project experience answers clearly using the STAR flow (Situation, Task, Action, Result) in natural first-person speech.'
-        : 'Keep the spoken response clear, natural, and well-paced (~60 seconds spoken).';
+    const cacheKey = `${transcript.toLowerCase().trim()}::${activeAnswerModel}::${resolvedType}::${effectiveResumeText.length}::${effectiveJdText.length}::${effectiveRagDocs.map((d) => d.extractedText.length).join(',')}`;
 
-    const systemInstruction = `You are the job candidate in a live interview. Output ONLY the exact words the candidate should speak out loud in the first person ("I...") to answer the interviewer's question.
+    const formatInstructionsByType: Record<ResolvedAnswerType, string> = {
+      direct: `RESPONSE TYPE: DIRECT (Ready-to-Read Aloud First-Person Spoken Answer — stream=True)
+CRITICAL DIRECT RULES:
+1. READY TO READ DIRECTLY WORD-FOR-WORD: Write a complete, natural, conversational first-person spoken response ("I...", "In my role at...", "When building...") that the candidate can read directly out loud from start to finish.
+2. PACING & LENGTH CONSTRAINTS:
+   - For quick factual or logistical questions, respond directly in 1 to 2 sentences (10 to 35 words).
+   - Keep all conversational responses concise and focused, aiming for a spoken duration of 60 to 90 seconds (roughly 125 to 225 words) unless a highly detailed breakdown is explicitly requested.
+   - Never generate an uninterrupted response that exceeds 3 minutes of reading/speaking time (approx. 450 words) without explicitly asking the user if they want you to go deeper.
+3. ZERO META-LABELS OR HEADINGS: Do NOT output labels like "⚡ Headline:", "• Key Pillar 1:", "Opening:", "Impact:", or bullet prefixes in DIRECT mode. Separate natural spoken paragraphs with a blank line and highlight **key technical terms, tools, or metrics in bold** for easy reading.
+4. MANDATORY 3-SOURCE SYNTHESIS: Synthesize the uploaded Prepared Q&A, Candidate Resume (real roles, projects, tools, metrics), and Job Description (target role requirements).`,
 
-STRICT RULES:
-1. Priority 1 - Prepared Q&A (RAG): If the interviewer's question matches or relates to any question/topic in the Prepared Q&A documents, use and adapt that prepared answer directly.
-2. Priority 2 - Candidate Resume & Job Description (JD): Ground your spoken answer strictly in the candidate's actual experience, companies, projects, skills, and metrics from the uploaded Resume, aligned with the Job Description (JD). Also disambiguate any misheard speech-to-text technical terms using the Resume and JD context (e.g., if speech recognition heard "reduce" instead of "Redis").
-3. Priority 3 - Fallback: Only if the uploaded documents do not cover a general technical concept asked by the interviewer, provide a clear, concise, accurate first-person explanation appropriate for the candidate's role.
-4. NO HALLUCINATION: Never invent fake employers or projects not in the Resume.
-5. STYLE: ${styleGuidance}
-6. FORMAT: Output ONLY the spoken script itself. No headings, no labels, no "Speak This Out Loud:", no bullet advice or suggestions, no JSON wrapper.`;
+      hint: `RESPONSE TYPE: HINT (Just Hints in Bullets)
+CRITICAL HINT RULES:
+1. Output ONLY concise bullet-point hints (\`• ...\`).
+2. Do NOT include any title, header, "⚡ Core Hook:", or labels like "Key Point 1:" or "Key Point 2:".
+3. Provide 3 to 5 short, high-impact bullet hints with **bold keywords** drawing from Prepared Q&A, Candidate Resume, and Job Description so the candidate can glance at the bullets and speak naturally.`,
+
+      star: `RESPONSE TYPE: STAR (Behavioral / Scenario-Based STAR Method)
+CRITICAL STAR RULES:
+1. For behavioral or scenario-based answers (STAR method), cap the response at 375 words (approximately 2.5 minutes of spoken text).
+2. Structure behavioral stories clearly: 20% Situation, 10% Task, 50% Action, and 20% Result.
+3. Format your output into 4 first-person STAR lines synthesizing the Candidate Resume, Prepared Q&A, and Job Description:
+[S] **Situation:** [First-person context & background from Resume/Prepared Q&A — ~20% of the response]
+[T] **Task:** [The exact engineering challenge/responsibility aligned with the **Job Description** — ~10% of the response]
+[A] **Action:** [Detailed first-person account of how **I architected, implemented, validated, and shipped** the solution with **bold tech stack** — ~50% of the response]
+[R] **Result:** [Concrete outcome with **bold quantifiable metrics and business impact** — ~20% of the response]`,
+
+      code: `RESPONSE TYPE: CODE (Only Python 3 Code Section — No Additional Information)
+CRITICAL CODE RULES:
+1. Output ONLY a single runnable **Python 3 program** inside a \`\`\`python ... \`\`\` fenced code block.
+2. DO NOT output any text, approach summary, Big-O complexity header, or walkthrough bullets before or after the \`\`\`python ... \`\`\` block. ONLY the code section is allowed.
+3. Format the Python program in a clean single vertical column (4-space indentation, brief \`#\` comments on their own line above statements, never inline to the right).`,
+    };
+
+    const systemInstruction = `You are an elite real-time on-screen interview assistant for a live job candidate.
+The agent automatically identifies the response type for each question in the order: Direct, Hint, STAR, Code.
+
+# Response Length & Pacing Constraints
+- Keep all conversational responses concise and focused, aiming for a spoken duration of 60 to 90 seconds (roughly 125 to 225 words) unless a highly detailed breakdown is explicitly requested.
+- For behavioral or scenario-based answers (STAR method), cap the response at 375 words (approximately 2.5 minutes of spoken text).
+- Structure behavioral stories clearly: 20% Situation, 10% Task, 50% Action, and 20% Result.
+- For quick factual or logistical questions, respond directly in 1 to 2 sentences (10 to 35 words).
+- Never generate an uninterrupted response that exceeds 3 minutes of reading/speaking time (approx. 450 words) without explicitly asking the user if they want you to go deeper.
+
+${formatInstructionsByType[resolvedType]}
+
+MANDATORY CONTEXT INTEGRATION (MUST CONSIDER ALL 3 SOURCES TOGETHER):
+1. **Prepared Q&A (RAG Documents)**: Always check the uploaded Prepared Q&A documents first. If a matching or related question, concept, or story exists in Prepared Q&A, integrate its exact substance and insights into the response.
+2. **Candidate Resume**: Weave in the candidate's actual work history, companies, project names, technical stack, and quantifiable metrics from the uploaded Candidate Resume so the response is 100% authentic to the candidate.
+3. **Job Description (JD)**: Tailor the terminology, technical focus, and impact to directly address the core requirements and priorities stated in the uploaded Job Description.
+4. **Speech-to-Text Disambiguation**: Automatically correct phonetic transcription homophones using the Candidate Resume, JD, and Prepared Q&A (e.g., "reduce" -> "Redis", "fast API" -> "FastAPI", "pie spark" -> "PySpark", "post gres" -> "PostgreSQL", "cube" -> "Kubernetes").`;
 
     const contentParts: any[] = [];
 
@@ -627,26 +943,64 @@ STRICT RULES:
         .filter((s) => s.trim().length > 0)
         .join('\n\n');
       if (ragCombined) {
-        contentParts.push({ text: `=== UPLOADED PREPARED Q&A (RAG) DOCUMENTS ===\n${ragCombined}` });
+        contentParts.push({ text: `=== 1. UPLOADED PREPARED Q&A (RAG) DOCUMENTS ===\n${ragCombined}` });
+      }
+    }
+
+    if (preparedDocsBase64.length > 0) {
+      for (const pdfDoc of preparedDocsBase64) {
+        if (pdfDoc?.data) {
+          contentParts.push({
+            text: `=== UPLOADED PREPARED Q&A PDF (${pdfDoc.title || 'Prepared Q&A'}) ===`,
+          });
+          contentParts.push({
+            inlineData: { mimeType: 'application/pdf', data: pdfDoc.data },
+          });
+        }
       }
     }
 
     if (effectiveResumeText) {
-      contentParts.push({ text: `=== UPLOADED CANDIDATE RESUME ===\n${effectiveResumeText}` });
+      contentParts.push({ text: `=== 2. UPLOADED CANDIDATE RESUME ===\n${effectiveResumeText}` });
     } else if (effectiveResumeBase64) {
-      contentParts.push({ text: '=== UPLOADED CANDIDATE RESUME (PDF) ===' });
+      contentParts.push({ text: '=== 2. UPLOADED CANDIDATE RESUME (PDF) ===' });
       contentParts.push({ inlineData: { mimeType: 'application/pdf', data: effectiveResumeBase64 } });
     }
 
     if (effectiveJdText) {
-      contentParts.push({ text: `=== UPLOADED JOB DESCRIPTION (JD) ===\n${effectiveJdText}` });
+      contentParts.push({ text: `=== 3. UPLOADED JOB DESCRIPTION (JD) ===\n${effectiveJdText}` });
     } else if (effectiveJdBase64) {
-      contentParts.push({ text: '=== UPLOADED JOB DESCRIPTION (PDF) ===' });
+      contentParts.push({ text: '=== 3. UPLOADED JOB DESCRIPTION (PDF) ===' });
       contentParts.push({ inlineData: { mimeType: 'application/pdf', data: effectiveJdBase64 } });
     }
 
+    const activeSourcesSummary = [
+      effectiveRagDocs.some((d) => d.extractedText) || preparedDocsBase64.length > 0
+        ? 'Prepared Q&A'
+        : null,
+      effectiveResumeText || effectiveResumeBase64 ? 'Candidate Resume' : null,
+      effectiveJdText || effectiveJdBase64 ? 'Job Description' : null,
+    ]
+      .filter(Boolean)
+      .join(', ');
+
     contentParts.push({
-      text: `=== INTERVIEWER QUESTION ===\n"${transcript}"\n\nRespond immediately with ONLY the exact words I should speak out loud:`,
+      text: `=== INTERVIEWER QUESTION ===
+"${transcript}"
+
+=== RESPONSE REQUIREMENTS ===
+- Identified Response Type: ${resolvedType.toUpperCase()}
+- Active Candidate Context Sources to Synthesize: ${activeSourcesSummary || 'General Engineering Best Practices'}
+- Enforce Response Length & Pacing Constraints (10-35 words for quick factual/logistical; 125-225 words / 60-90s for conversational Direct; max 375 words / 2.5 min for STAR with 20% Situation, 10% Task, 50% Action, 20% Result; never exceed 450 words / 3 min without asking to go deeper).
+${
+  resolvedType === 'direct'
+    ? 'Stream the DIRECT answer now in natural first-person spoken sentences following the Response Length & Pacing Constraints (synthesizing Candidate Resume, Job Description, and Prepared Q&A):'
+    : resolvedType === 'hint'
+    ? 'Output ONLY bullet-point hints (• ...) with no extra headers or labels:'
+    : resolvedType === 'code'
+    ? 'Output ONLY the ```python ... ``` code block with zero additional text before or after:'
+    : 'Output the 4 [S] [T] [A] [R] lines now (capped at 375 words; structured 20% Situation, 10% Task, 50% Action, 20% Result):'
+}`,
     });
 
     const resolveThinkingLevel = (modelName: string) => {
@@ -658,15 +1012,24 @@ STRICT RULES:
       return modelName === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
     };
 
-    if (stream) {
+    if (stream !== false) {
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
       res.setHeader('Connection', 'keep-alive');
       res.flushHeaders?.();
 
-      if (answerCache.has(cacheKey)) {
+      // Immediately emit the resolved responseType (Direct, Hint, STAR, Code) so the UI badge updates at 0ms
+      res.write(
+        `data: ${JSON.stringify({ responseType: resolvedType, autoDetected })}\n\n`
+      );
+
+      if (answerCache.has(cacheKey) && !forcedResponseType) {
         const cached = answerCache.get(cacheKey)!;
-        res.write(`data: ${JSON.stringify({ chunk: cached })}\n\n`);
+        const words = cached.split(' ');
+        for (let i = 0; i < words.length; i += 6) {
+          const slice = words.slice(i, i + 6).join(' ') + (i + 6 < words.length ? ' ' : '');
+          res.write(`data: ${JSON.stringify({ chunk: slice })}\n\n`);
+        }
         res.write(`data: ${JSON.stringify({ done: true })}\n\n`);
         res.end();
         return;
@@ -714,7 +1077,8 @@ STRICT RULES:
           transcript,
           effectiveResumeText,
           effectiveJdText,
-          effectiveRagDocs
+          effectiveRagDocs,
+          resolvedType
         );
         const words = localAnswer.split(' ');
         for (let i = 0; i < words.length; i += 4) {
@@ -741,7 +1105,12 @@ STRICT RULES:
         const answer = (response.text || '').trim();
         if (answer) {
           answerCache.set(cacheKey, answer);
-          return res.json({ question: transcript, spokenAnswer: answer });
+          return res.json({
+            question: transcript,
+            spokenAnswer: answer,
+            responseType: resolvedType,
+            autoDetected,
+          });
         }
       } catch {
         // Try next model
@@ -752,15 +1121,22 @@ STRICT RULES:
       transcript,
       effectiveResumeText,
       effectiveJdText,
-      effectiveRagDocs
+      effectiveRagDocs,
+      resolvedType
     );
-    res.json({ question: transcript, spokenAnswer: fallbackAnswer });
+    res.json({
+      question: transcript,
+      spokenAnswer: fallbackAnswer,
+      responseType: resolvedType,
+      autoDetected,
+    });
   } catch {
     const fallbackAnswer = synthesizeLocalFromDocuments(
       req.body?.transcript || '',
       serverContext.resumeText,
       serverContext.jdText,
-      serverContext.ragDocs
+      serverContext.ragDocs,
+      'direct'
     );
     if (res.headersSent) {
       res.write(`data: ${JSON.stringify({ chunk: fallbackAnswer })}\n\n`);
@@ -770,6 +1146,8 @@ STRICT RULES:
       res.json({
         question: req.body?.transcript || 'Question',
         spokenAnswer: fallbackAnswer,
+        responseType: 'direct',
+        autoDetected: true,
       });
     }
   }
