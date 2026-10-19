@@ -46,6 +46,27 @@ const AUDIO_MODELS = [
   'gemini-flash-latest',
 ];
 
+interface AppSettings {
+  answerModel: string;
+  audioModel: string;
+  temperature: number;
+  thinkingLevel: 'MINIMAL' | 'LOW' | 'MEDIUM';
+  answerStyle: 'concise' | 'balanced' | 'star';
+  autoFallback: boolean;
+}
+
+const serverSettings: AppSettings = {
+  answerModel: process.env.GEMINI_ANSWER_MODEL || 'gemini-3.1-flash-lite',
+  audioModel: process.env.GEMINI_AUDIO_MODEL || 'gemini-3.5-transcribe',
+  temperature:
+    process.env.GEMINI_TEMPERATURE !== undefined && !Number.isNaN(Number(process.env.GEMINI_TEMPERATURE))
+      ? Number(process.env.GEMINI_TEMPERATURE)
+      : 0.3,
+  thinkingLevel: 'MINIMAL',
+  answerStyle: 'balanced',
+  autoFallback: true,
+};
+
 // In-memory cache of extracted document texts for ultra-fast streaming latency
 interface StoredContext {
   resumeText: string;
@@ -71,6 +92,37 @@ const serverContext: StoredContext = {
 
 // Session answer cache to avoid burning quota on repeated questions
 const answerCache = new Map<string, string>();
+
+app.get('/api/interview/settings', (_req, res) => {
+  res.json({ settings: serverSettings });
+});
+
+app.post('/api/interview/settings', (req, res) => {
+  const { answerModel, audioModel, temperature, thinkingLevel, answerStyle, autoFallback } =
+    req.body || {};
+
+  if (typeof answerModel === 'string' && answerModel.trim()) {
+    serverSettings.answerModel = answerModel.trim();
+  }
+  if (typeof audioModel === 'string' && audioModel.trim()) {
+    serverSettings.audioModel = audioModel.trim();
+  }
+  if (typeof temperature === 'number' && temperature >= 0 && temperature <= 1) {
+    serverSettings.temperature = temperature;
+  }
+  if (thinkingLevel === 'MINIMAL' || thinkingLevel === 'LOW' || thinkingLevel === 'MEDIUM') {
+    serverSettings.thinkingLevel = thinkingLevel;
+  }
+  if (answerStyle === 'concise' || answerStyle === 'balanced' || answerStyle === 'star') {
+    serverSettings.answerStyle = answerStyle;
+  }
+  if (typeof autoFallback === 'boolean') {
+    serverSettings.autoFallback = autoFallback;
+  }
+
+  answerCache.clear();
+  res.json({ ok: true, settings: serverSettings });
+});
 
 // Helper: Extract Q&A pairs and relevant passages from uploaded RAG & Resume documents locally
 function synthesizeLocalFromDocuments(
@@ -405,12 +457,20 @@ function isLikelyQuestionOrInterviewPrompt(text: string): boolean {
 // Transcribe incoming System / Call Audio strictly verbatim (NEVER pass Resume/JD here so it cannot invent questions!)
 app.post('/api/interview/transcribe-audio', async (req, res) => {
   try {
-    const { audioBase64, mimeType = 'audio/webm' } = req.body;
+    const { audioBase64, mimeType = 'audio/webm', audioModel, autoFallback } = req.body;
     if (!audioBase64) {
       return res.status(400).json({ error: 'Missing audioBase64', transcript: '' });
     }
 
     const cleanMimeType = mimeType.split(';')[0].trim() || 'audio/webm';
+    const primaryAudioModel =
+      (typeof audioModel === 'string' && audioModel.trim()) || serverSettings.audioModel;
+    const useFallback =
+      typeof autoFallback === 'boolean' ? autoFallback : serverSettings.autoFallback;
+
+    const orderedAudioModels = useFallback
+      ? [primaryAudioModel, ...AUDIO_MODELS.filter((m) => m !== primaryAudioModel)]
+      : [primaryAudioModel];
 
     // CRITICAL: Do NOT include Resume or JD text in the audio transcription prompt!
     // Including context text causes audio models to hallucinate interview questions when audio is quiet/noisy.
@@ -424,7 +484,7 @@ STRICT ANTI-HALLUCINATION RULES:
     let transcript = '';
     let isQuestion = false;
 
-    for (const modelName of AUDIO_MODELS) {
+    for (const modelName of orderedAudioModels) {
       try {
         const response = await getAiClient().models.generateContent({
           model: modelName,
@@ -492,11 +552,37 @@ app.post('/api/interview/process', async (req, res) => {
       jdText,
       jdBase64,
       preparedDocs,
+      answerModel,
+      temperature,
+      thinkingLevel,
+      answerStyle,
+      autoFallback,
     } = req.body;
 
     if (!transcript) {
       return res.status(400).json({ error: 'Transcript is required' });
     }
+
+    const activeAnswerModel =
+      (typeof answerModel === 'string' && answerModel.trim()) || serverSettings.answerModel;
+    const activeTemperature =
+      typeof temperature === 'number' && temperature >= 0 && temperature <= 1
+        ? temperature
+        : serverSettings.temperature;
+    const activeThinking =
+      thinkingLevel === 'MINIMAL' || thinkingLevel === 'LOW' || thinkingLevel === 'MEDIUM'
+        ? thinkingLevel
+        : serverSettings.thinkingLevel;
+    const activeStyle =
+      answerStyle === 'concise' || answerStyle === 'balanced' || answerStyle === 'star'
+        ? answerStyle
+        : serverSettings.answerStyle;
+    const useFallback =
+      typeof autoFallback === 'boolean' ? autoFallback : serverSettings.autoFallback;
+
+    const orderedStreamModels = useFallback
+      ? [activeAnswerModel, ...STREAM_MODELS.filter((m) => m !== activeAnswerModel)]
+      : [activeAnswerModel];
 
     const effectiveResumeText = resumeText || serverContext.resumeText;
     const effectiveResumeBase64 = resumeBase64 || serverContext.resumeBase64;
@@ -514,7 +600,14 @@ app.post('/api/interview/process', async (req, res) => {
             extractedText: d.extractedText,
           }));
 
-    const cacheKey = `${transcript.toLowerCase().trim()}::${effectiveResumeText.length}::${effectiveJdText.length}::${effectiveRagDocs.length}`;
+    const cacheKey = `${transcript.toLowerCase().trim()}::${activeAnswerModel}::${activeStyle}::${effectiveResumeText.length}::${effectiveJdText.length}::${effectiveRagDocs.length}`;
+
+    const styleGuidance =
+      activeStyle === 'concise'
+        ? 'Keep the spoken response concise and punchy (3 to 5 sentences, ~30–45 seconds spoken).'
+        : activeStyle === 'star'
+        ? 'Structure behavioral or project experience answers clearly using the STAR flow (Situation, Task, Action, Result) in natural first-person speech.'
+        : 'Keep the spoken response clear, natural, and well-paced (~60 seconds spoken).';
 
     const systemInstruction = `You are the job candidate in a live interview. Output ONLY the exact words the candidate should speak out loud in the first person ("I...") to answer the interviewer's question.
 
@@ -523,7 +616,8 @@ STRICT RULES:
 2. Priority 2 - Candidate Resume & Job Description (JD): Ground your spoken answer strictly in the candidate's actual experience, companies, projects, skills, and metrics from the uploaded Resume, aligned with the Job Description (JD). Also disambiguate any misheard speech-to-text technical terms using the Resume and JD context (e.g., if speech recognition heard "reduce" instead of "Redis").
 3. Priority 3 - Fallback: Only if the uploaded documents do not cover a general technical concept asked by the interviewer, provide a clear, concise, accurate first-person explanation appropriate for the candidate's role.
 4. NO HALLUCINATION: Never invent fake employers or projects not in the Resume.
-5. FORMAT: Output ONLY the spoken script itself. No headings, no labels, no "Speak This Out Loud:", no bullet advice or suggestions, no JSON wrapper.`;
+5. STYLE: ${styleGuidance}
+6. FORMAT: Output ONLY the spoken script itself. No headings, no labels, no "Speak This Out Loud:", no bullet advice or suggestions, no JSON wrapper.`;
 
     const contentParts: any[] = [];
 
@@ -555,6 +649,15 @@ STRICT RULES:
       text: `=== INTERVIEWER QUESTION ===\n"${transcript}"\n\nRespond immediately with ONLY the exact words I should speak out loud:`,
     });
 
+    const resolveThinkingLevel = (modelName: string) => {
+      if (modelName === 'gemini-4-argon') {
+        return activeThinking === 'MEDIUM' ? ThinkingLevel.MEDIUM : ThinkingLevel.LOW;
+      }
+      if (activeThinking === 'MEDIUM') return ThinkingLevel.MEDIUM;
+      if (activeThinking === 'LOW') return ThinkingLevel.LOW;
+      return modelName === 'gemini-3.1-flash-lite' ? ThinkingLevel.MINIMAL : ThinkingLevel.LOW;
+    };
+
     if (stream) {
       res.setHeader('Content-Type', 'text/event-stream; charset=utf-8');
       res.setHeader('Cache-Control', 'no-cache, no-transform');
@@ -572,7 +675,7 @@ STRICT RULES:
       let streamedAnyChunk = false;
       let fullStreamedText = '';
 
-      for (const modelName of STREAM_MODELS) {
+      for (const modelName of orderedStreamModels) {
         try {
           const responseStream = await getAiClient().models.generateContentStream({
             model: modelName,
@@ -580,12 +683,9 @@ STRICT RULES:
             config: {
               systemInstruction,
               thinkingConfig: {
-                thinkingLevel:
-                  modelName === 'gemini-3.1-flash-lite'
-                    ? ThinkingLevel.MINIMAL
-                    : ThinkingLevel.LOW,
+                thinkingLevel: resolveThinkingLevel(modelName),
               },
-              temperature: 0.3,
+              temperature: activeTemperature,
             },
           });
 
@@ -628,14 +728,14 @@ STRICT RULES:
       return;
     }
 
-    for (const modelName of STREAM_MODELS) {
+    for (const modelName of orderedStreamModels) {
       try {
         const response = await getAiClient().models.generateContent({
           model: modelName,
           contents: contentParts,
           config: {
             systemInstruction,
-            temperature: 0.3,
+            temperature: activeTemperature,
           },
         });
         const answer = (response.text || '').trim();

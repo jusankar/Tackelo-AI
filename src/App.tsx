@@ -1,4 +1,5 @@
 import React, { useState, useEffect, useRef } from 'react';
+import { createPortal } from 'react-dom';
 import {
   Square,
   Briefcase,
@@ -18,6 +19,15 @@ import {
   Volume2,
   MonitorSpeaker,
   Radio,
+  Settings,
+  Cpu,
+  Sliders,
+  ExternalLink,
+  Move,
+  Minimize2,
+  Maximize2,
+  Menu,
+  X,
 } from 'lucide-react';
 
 interface QnAItem {
@@ -49,6 +59,79 @@ interface PreparedDoc {
 
 type AudioCaptureMode = 'system_audio' | 'loopback_device';
 
+interface ModelOption {
+  id: string;
+  name: string;
+  badge: string;
+  recommended?: boolean;
+  description: string;
+  bestFor: string;
+}
+
+const SUGGESTED_ANSWER_MODELS: ModelOption[] = [
+  {
+    id: 'gemini-3.1-flash-lite',
+    name: 'Gemini 3.1 Flash Lite',
+    badge: 'Recommended · Fastest & Highest Quota',
+    recommended: true,
+    description:
+      'Ultra-low latency streaming with minimal thinking overhead and the highest request quota.',
+    bestFor: 'Real-time live interviews, rapid technical Q&A, and uninterrupted token streaming.',
+  },
+  {
+    id: 'gemini-flash-latest',
+    name: 'Gemini Flash (Latest)',
+    badge: 'Balanced Speed & Depth',
+    description:
+      'Balances fast streaming speed with deeper contextual synthesis across Resume, JD, and RAG docs.',
+    bestFor: 'Behavioral STAR stories, role-aligned project walkthroughs, and general engineering interviews.',
+  },
+  {
+    id: 'gemini-3.8-flash',
+    name: 'Gemini 3.8 Flash',
+    badge: 'High-Accuracy Flash',
+    description:
+      'Strong technical reasoning and structured articulation while maintaining live conversational pacing.',
+    bestFor: 'Architecture explanations, API design questions, and multi-document RAG synthesis.',
+  },
+  {
+    id: 'gemini-4-argon',
+    name: 'Gemini 4 Pro (Argon)',
+    badge: 'Deepest Reasoning · Paid Tier',
+    description:
+      'Flagship reasoning model for complex system design, distributed systems trade-offs, and coding architecture.',
+    bestFor: 'Staff/Principal engineering interviews and deep algorithmic or system design rounds.',
+  },
+];
+
+const SUGGESTED_AUDIO_MODELS: ModelOption[] = [
+  {
+    id: 'gemini-3.5-transcribe',
+    name: 'Gemini 3.5 Transcribe',
+    badge: 'Recommended · Dedicated Speech-to-Text',
+    recommended: true,
+    description:
+      'Purpose-built speech transcription model tuned for accurate technical terms and question detection.',
+    bestFor: 'Capturing incoming Zoom, Teams, and Google Meet interviewer audio streams.',
+  },
+  {
+    id: 'gemini-3.1-flash-lite',
+    name: 'Gemini 3.1 Flash Lite (Audio)',
+    badge: 'High-Quota Audio Fallback',
+    description:
+      'Fast multimodal audio understanding with generous rate limits for long interview sessions.',
+    bestFor: 'Continuous multi-round interviews where high request throughput is needed.',
+  },
+  {
+    id: 'gemini-flash-latest',
+    name: 'Gemini Flash Latest (Audio)',
+    badge: 'Contextual Multimodal Audio',
+    description:
+      'High-accuracy multimodal speech recognition for accented speech or compressed call audio.',
+    bestFor: 'Noisy or heavily compressed meeting audio streams.',
+  },
+];
+
 const ACCEPTED_FILE_EXTENSIONS =
   '.pdf,.docx,.txt,application/pdf,application/vnd.openxmlformats-officedocument.wordprocessingml.document,text/plain';
 
@@ -65,7 +148,17 @@ function isSupportedDocFile(file: File): boolean {
 }
 
 export default function App() {
-  const [activeTab, setActiveTab] = useState<'setup' | 'copilot' | 'history'>('setup');
+  const [activeTab, setActiveTab] = useState<'setup' | 'copilot' | 'history' | 'settings'>('setup');
+  const [isMobileMenuOpen, setIsMobileMenuOpen] = useState<boolean>(false);
+
+  // Application & Model Configuration Settings
+  const [answerModel, setAnswerModel] = useState<string>('gemini-3.1-flash-lite');
+  const [audioModel, setAudioModel] = useState<string>('gemini-3.5-transcribe');
+  const [temperature, setTemperature] = useState<number>(0.3);
+  const [thinkingLevel, setThinkingLevel] = useState<'MINIMAL' | 'LOW' | 'MEDIUM'>('MINIMAL');
+  const [answerStyle, setAnswerStyle] = useState<'concise' | 'balanced' | 'star'>('balanced');
+  const [autoFallback, setAutoFallback] = useState<boolean>(true);
+  const [settingsSavedMsg, setSettingsSavedMsg] = useState<string>('');
 
   // Document Upload States (PDF, DOCX, TXT)
   const [resumeFile, setResumeFile] = useState<UploadedDocFile | null>(null);
@@ -95,26 +188,138 @@ export default function App() {
   const [isProcessing, setIsProcessing] = useState(false);
   const [manualInput, setManualInput] = useState('');
 
-  // Floating HUD Overlay State
+  // Floating HUD Overlay & Separate Always-On-Top Window State
   const [isFloatingMode, setIsFloatingMode] = useState(false);
-  const [opacity, setOpacity] = useState(0.95);
+  const [opacity, setOpacity] = useState(0.78);
+  const [hudFontSize, setHudFontSize] = useState<'sm' | 'base' | 'lg'>('base');
+  const [isHudMinimized, setIsHudMinimized] = useState(false);
+  const [hudPosition, setHudPosition] = useState<{ x: number; y: number }>({ x: 24, y: 72 });
+  const [pipContainer, setPipContainer] = useState<HTMLElement | null>(null);
+  const [isVideoPipActive, setIsVideoPipActive] = useState(false);
+
+  const pipWindowRef = useRef<Window | null>(null);
+  const hudCanvasRef = useRef<HTMLCanvasElement | null>(null);
+  const hudVideoRef = useRef<HTMLVideoElement | null>(null);
+  const dragOffsetRef = useRef<{ startX: number; startY: number; origX: number; origY: number } | null>(
+    null
+  );
 
   const [copiedId, setCopiedId] = useState<string | null>(null);
 
-  // Refs to ensure audio callbacks always read latest uploaded documents without stale closures
+  // Refs to ensure audio callbacks always read latest uploaded documents & settings without stale closures
   const contextRef = useRef<{
     resumeFile: UploadedDocFile | null;
     jdFile: UploadedDocFile | null;
     preparedDocs: PreparedDoc[];
+    answerModel: string;
+    audioModel: string;
+    temperature: number;
+    thinkingLevel: 'MINIMAL' | 'LOW' | 'MEDIUM';
+    answerStyle: 'concise' | 'balanced' | 'star';
+    autoFallback: boolean;
   }>({
     resumeFile: null,
     jdFile: null,
     preparedDocs: [],
+    answerModel: 'gemini-3.1-flash-lite',
+    audioModel: 'gemini-3.5-transcribe',
+    temperature: 0.3,
+    thinkingLevel: 'MINIMAL',
+    answerStyle: 'balanced',
+    autoFallback: true,
   });
 
   useEffect(() => {
-    contextRef.current = { resumeFile, jdFile, preparedDocs };
-  }, [resumeFile, jdFile, preparedDocs]);
+    contextRef.current = {
+      resumeFile,
+      jdFile,
+      preparedDocs,
+      answerModel,
+      audioModel,
+      temperature,
+      thinkingLevel,
+      answerStyle,
+      autoFallback,
+    };
+  }, [
+    resumeFile,
+    jdFile,
+    preparedDocs,
+    answerModel,
+    audioModel,
+    temperature,
+    thinkingLevel,
+    answerStyle,
+    autoFallback,
+  ]);
+
+  // Load initial model & app settings from server/localStorage
+  useEffect(() => {
+    try {
+      const saved = localStorage.getItem('tackelo_ai_settings');
+      if (saved) {
+        const parsed = JSON.parse(saved);
+        if (parsed.answerModel) setAnswerModel(parsed.answerModel);
+        if (parsed.audioModel) setAudioModel(parsed.audioModel);
+        if (typeof parsed.temperature === 'number') setTemperature(parsed.temperature);
+        if (parsed.thinkingLevel) setThinkingLevel(parsed.thinkingLevel);
+        if (parsed.answerStyle) setAnswerStyle(parsed.answerStyle);
+        if (typeof parsed.autoFallback === 'boolean') setAutoFallback(parsed.autoFallback);
+        return;
+      }
+    } catch {}
+
+    fetch('/api/interview/settings')
+      .then((r) => r.json())
+      .then((data) => {
+        if (data?.settings) {
+          if (data.settings.answerModel) setAnswerModel(data.settings.answerModel);
+          if (data.settings.audioModel) setAudioModel(data.settings.audioModel);
+          if (typeof data.settings.temperature === 'number')
+            setTemperature(data.settings.temperature);
+          if (data.settings.thinkingLevel) setThinkingLevel(data.settings.thinkingLevel);
+          if (data.settings.answerStyle) setAnswerStyle(data.settings.answerStyle);
+          if (typeof data.settings.autoFallback === 'boolean')
+            setAutoFallback(data.settings.autoFallback);
+        }
+      })
+      .catch(() => {});
+  }, []);
+
+  const saveAppSettings = async (nextSettings?: Partial<{
+    answerModel: string;
+    audioModel: string;
+    temperature: number;
+    thinkingLevel: 'MINIMAL' | 'LOW' | 'MEDIUM';
+    answerStyle: 'concise' | 'balanced' | 'star';
+    autoFallback: boolean;
+  }>) => {
+    const payload = {
+      answerModel: nextSettings?.answerModel ?? answerModel,
+      audioModel: nextSettings?.audioModel ?? audioModel,
+      temperature: nextSettings?.temperature ?? temperature,
+      thinkingLevel: nextSettings?.thinkingLevel ?? thinkingLevel,
+      answerStyle: nextSettings?.answerStyle ?? answerStyle,
+      autoFallback: nextSettings?.autoFallback ?? autoFallback,
+    };
+
+    try {
+      localStorage.setItem('tackelo_ai_settings', JSON.stringify(payload));
+    } catch {}
+
+    try {
+      await fetch('/api/interview/settings', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify(payload),
+      });
+      setSettingsSavedMsg('Settings saved and applied to live session.');
+      setTimeout(() => setSettingsSavedMsg(''), 2500);
+    } catch {
+      setSettingsSavedMsg('Settings saved locally.');
+      setTimeout(() => setSettingsSavedMsg(''), 2500);
+    }
+  };
 
   // Web Audio, MediaRecorder & Hidden Media Sink Refs (Strictly Incoming Stream Only - No Laptop Mic)
   const mediaStreamRef = useRef<MediaStream | null>(null);
@@ -296,7 +501,16 @@ export default function App() {
     setTranscriptLog((prev) => [initialItem, ...prev]);
     setIsProcessing(true);
 
-    const { resumeFile: curResume, jdFile: curJd, preparedDocs: curRag } = contextRef.current;
+    const {
+      resumeFile: curResume,
+      jdFile: curJd,
+      preparedDocs: curRag,
+      answerModel: curAnswerModel,
+      temperature: curTemp,
+      thinkingLevel: curThinking,
+      answerStyle: curStyle,
+      autoFallback: curFallback,
+    } = contextRef.current;
 
     try {
       const response = await fetch('/api/interview/process', {
@@ -305,6 +519,11 @@ export default function App() {
         body: JSON.stringify({
           transcript: cleanQuestion,
           stream: true,
+          answerModel: curAnswerModel,
+          temperature: curTemp,
+          thinkingLevel: curThinking,
+          answerStyle: curStyle,
+          autoFallback: curFallback,
           resumeText: curResume?.extractedText,
           resumeBase64:
             curResume?.mimeType === 'application/pdf' || curResume?.name.toLowerCase().endsWith('.pdf')
@@ -440,6 +659,8 @@ export default function App() {
           body: JSON.stringify({
             audioBase64: base64Audio,
             mimeType: blob.type || 'audio/webm',
+            audioModel: contextRef.current.audioModel,
+            autoFallback: contextRef.current.autoFallback,
           }),
         });
 
@@ -1029,125 +1250,747 @@ export default function App() {
     URL.revokeObjectURL(url);
   };
 
+  // Render live streaming question & spoken answer onto offscreen Canvas for Always-On-Top Video Picture-in-Picture window
+  useEffect(() => {
+    const canvas = hudCanvasRef.current;
+    if (!canvas) return;
+    const ctx = canvas.getContext('2d');
+    if (!ctx) return;
+
+    const W = canvas.width;
+    const H = canvas.height;
+
+    // Translucent dark HUD background
+    ctx.clearRect(0, 0, W, H);
+    ctx.fillStyle = `rgba(2, 6, 23, ${Math.max(0.4, opacity)})`;
+    ctx.fillRect(0, 0, W, H);
+
+    // Top HUD Header Bar
+    ctx.fillStyle = 'rgba(30, 27, 75, 0.92)';
+    ctx.fillRect(0, 0, W, 54);
+    ctx.strokeStyle = 'rgba(99, 102, 241, 0.45)';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(0, 54);
+    ctx.lineTo(W, 54);
+    ctx.stroke();
+
+    ctx.fillStyle = '#ffffff';
+    ctx.font = 'bold 20px system-ui, -apple-system, sans-serif';
+    ctx.fillText('Tackelo AI · Live Floating HUD', 20, 34);
+
+    // Audio Status Pill on right of header
+    ctx.fillStyle = isListening
+      ? isSpeakingDetected
+        ? '#34d399'
+        : '#818cf8'
+      : '#94a3b8';
+    ctx.font = '600 15px ui-monospace, monospace';
+    const statusLabel = isListening
+      ? isSpeakingDetected
+        ? '● INTERVIEWER SPEAKING...'
+        : '● LISTENING (INCOMING AUDIO)'
+      : '○ IDLE';
+    ctx.fillText(statusLabel, W - ctx.measureText(statusLabel).width - 20, 34);
+
+    const latest = transcriptLog[0];
+    if (!latest) {
+      ctx.fillStyle = '#94a3b8';
+      ctx.font = '500 22px system-ui, -apple-system, sans-serif';
+      ctx.fillText('Ready for incoming interviewer questions...', 28, 130);
+      ctx.font = '400 17px system-ui, -apple-system, sans-serif';
+      ctx.fillStyle = '#64748b';
+      ctx.fillText(
+        'Keep this Always-On-Top window open over Zoom, Teams, Meet, or your IDE.',
+        28,
+        168
+      );
+      ctx.fillText(
+        'Spoken answers will stream here word-by-word in real time.',
+        28,
+        198
+      );
+      return;
+    }
+
+    // Draw Question Box
+    ctx.fillStyle = 'rgba(15, 23, 42, 0.9)';
+    ctx.fillRect(18, 68, W - 36, 68);
+    ctx.strokeStyle = 'rgba(99, 102, 241, 0.4)';
+    ctx.strokeRect(18, 68, W - 36, 68);
+
+    ctx.fillStyle = '#a5b4fc';
+    ctx.font = 'bold 17px ui-monospace, monospace';
+    const qPrefix = `Q: "${latest.question}"`;
+    const maxQWidth = W - 64;
+    let qLine = qPrefix;
+    if (ctx.measureText(qLine).width > maxQWidth) {
+      while (qLine.length > 10 && ctx.measureText(qLine + '..."').width > maxQWidth) {
+        qLine = qLine.slice(0, -1);
+      }
+      qLine += '..."';
+    }
+    ctx.fillText(qLine, 32, 108);
+
+    // Draw Spoken Answer Body with word wrapping and auto-scroll for long streaming answers
+    const fontPx = hudFontSize === 'lg' ? 25 : hudFontSize === 'sm' ? 18 : 22;
+    const lineHeight = Math.round(fontPx * 1.48);
+    ctx.font = `500 ${fontPx}px system-ui, -apple-system, sans-serif`;
+    ctx.fillStyle = '#f8fafc';
+
+    const answerText = latest.spokenAnswer || (latest.isStreaming ? 'Generating answer...' : '');
+    const paragraphs = answerText.split(/\n+/);
+    const wrappedLines: string[] = [];
+    const maxLineWidth = W - 56;
+
+    for (const para of paragraphs) {
+      const words = para.split(/\s+/);
+      let currentLine = '';
+      for (const word of words) {
+        const testLine = currentLine ? `${currentLine} ${word}` : word;
+        if (ctx.measureText(testLine).width > maxLineWidth && currentLine) {
+          wrappedLines.push(currentLine);
+          currentLine = word;
+        } else {
+          currentLine = testLine;
+        }
+      }
+      if (currentLine) wrappedLines.push(currentLine);
+    }
+
+    const availableHeight = H - 165;
+    const maxVisibleLines = Math.max(1, Math.floor(availableHeight / lineHeight));
+    const visibleLines =
+      wrappedLines.length > maxVisibleLines
+        ? wrappedLines.slice(wrappedLines.length - maxVisibleLines)
+        : wrappedLines;
+
+    let y = 175;
+    for (const line of visibleLines) {
+      ctx.fillText(line, 28, y);
+      y += lineHeight;
+    }
+  }, [transcriptLog, isListening, isSpeakingDetected, opacity, hudFontSize]);
+
+  // Handle dragging the in-page translucent HUD panel
+  useEffect(() => {
+    const handleMouseMove = (e: MouseEvent) => {
+      if (!dragOffsetRef.current) return;
+      const dx = e.clientX - dragOffsetRef.current.startX;
+      const dy = e.clientY - dragOffsetRef.current.startY;
+      setHudPosition({
+        x: Math.max(8, Math.min(window.innerWidth - 320, dragOffsetRef.current.origX + dx)),
+        y: Math.max(8, Math.min(window.innerHeight - 100, dragOffsetRef.current.origY + dy)),
+      });
+    };
+    const handleMouseUp = () => {
+      dragOffsetRef.current = null;
+    };
+    window.addEventListener('mousemove', handleMouseMove);
+    window.addEventListener('mouseup', handleMouseUp);
+    return () => {
+      window.removeEventListener('mousemove', handleMouseMove);
+      window.removeEventListener('mouseup', handleMouseUp);
+    };
+  }, []);
+
+  // Open a true separate OS-level Always-On-Top Floating HUD Window
+  // Uses Document Picture-in-Picture (interactive portal) or falls back to Canvas-to-Video Picture-in-Picture
+  const openSeparateAlwaysOnTopHud = async () => {
+    setIsFloatingMode(true);
+
+    // 1. Try Document Picture-in-Picture API (opens a separate always-on-top interactive window)
+    const docPip = (window as any).documentPictureInPicture;
+    if (docPip && typeof docPip.requestWindow === 'function') {
+      try {
+        if (pipWindowRef.current && !pipWindowRef.current.closed) {
+          pipWindowRef.current.focus();
+          return;
+        }
+        const pipWin: Window = await docPip.requestWindow({
+          width: 480,
+          height: 580,
+        });
+        pipWindowRef.current = pipWin;
+        pipWin.document.title = 'Tackelo AI — Floating HUD';
+
+        // Copy all stylesheets into the separate always-on-top window
+        Array.from(document.querySelectorAll('link[rel="stylesheet"], style')).forEach((node) => {
+          pipWin.document.head.appendChild(node.cloneNode(true));
+        });
+
+        pipWin.document.body.style.margin = '0';
+        pipWin.document.body.style.backgroundColor = 'rgb(2, 6, 23)';
+        pipWin.document.body.style.color = 'rgb(241, 245, 249)';
+        pipWin.document.body.style.overflow = 'auto';
+
+        const container = pipWin.document.createElement('div');
+        container.id = 'tackelo-pip-root';
+        pipWin.document.body.appendChild(container);
+        setPipContainer(container);
+
+        pipWin.addEventListener('pagehide', () => {
+          setPipContainer(null);
+          pipWindowRef.current = null;
+        });
+        return;
+      } catch {
+        // If blocked by iframe permissions policy, proceed to Video Picture-in-Picture fallback
+      }
+    }
+
+    // 2. Fallback: Always-On-Top Video Picture-in-Picture teleprompter (works even inside iframes)
+    try {
+      const canvas = hudCanvasRef.current;
+      const video = hudVideoRef.current;
+      if (canvas && video) {
+        if (document.pictureInPictureElement) {
+          return;
+        }
+        if (!video.srcObject) {
+          const stream = (canvas as any).captureStream
+            ? (canvas as any).captureStream(20)
+            : null;
+          if (stream) {
+            video.srcObject = stream;
+          }
+        }
+        await video.play();
+        if (typeof (video as any).requestPictureInPicture === 'function') {
+          video.onleavepictureinpicture = () => setIsVideoPipActive(false);
+          await (video as any).requestPictureInPicture();
+          setIsVideoPipActive(true);
+        }
+      }
+    } catch {
+      // Draggable translucent overlay remains active
+    }
+  };
+
+  const closeFloatingHud = async () => {
+    setIsFloatingMode(false);
+    if (pipWindowRef.current && !pipWindowRef.current.closed) {
+      try {
+        pipWindowRef.current.close();
+      } catch {}
+      pipWindowRef.current = null;
+      setPipContainer(null);
+    }
+    if (document.pictureInPictureElement) {
+      try {
+        await document.exitPictureInPicture();
+      } catch {}
+      setIsVideoPipActive(false);
+    }
+  };
+
+  const toggleFloatingHud = () => {
+    if (isFloatingMode || pipContainer || isVideoPipActive) {
+      closeFloatingHud();
+    } else {
+      openSeparateAlwaysOnTopHud();
+    }
+  };
+
+  const renderHudContent = (isInsideSeparateWindow: boolean) => {
+    const textSizeClass =
+      hudFontSize === 'lg'
+        ? 'text-lg leading-relaxed'
+        : hudFontSize === 'sm'
+        ? 'text-xs leading-relaxed'
+        : 'text-sm leading-relaxed';
+
+    return (
+      <div
+        className="flex flex-col h-full text-slate-100 font-sans select-text"
+        style={{
+          backgroundColor: `rgba(2, 6, 23, ${opacity})`,
+          backdropFilter: 'blur(16px)',
+        }}
+      >
+        {/* Top Draggable / Control Header */}
+        <div
+          onMouseDown={(e) => {
+            if (isInsideSeparateWindow) return;
+            if ((e.target as HTMLElement).closest('button, input, select')) return;
+            dragOffsetRef.current = {
+              startX: e.clientX,
+              startY: e.clientY,
+              origX: hudPosition.x,
+              origY: hudPosition.y,
+            };
+          }}
+          className={`flex items-center justify-between gap-2 px-3.5 py-2.5 border-b border-indigo-500/30 bg-slate-900/75 ${
+            !isInsideSeparateWindow ? 'cursor-move' : ''
+          }`}
+        >
+          <div className="flex items-center gap-2">
+            {!isInsideSeparateWindow && <Move className="w-3.5 h-3.5 text-indigo-400 shrink-0" />}
+            <span className="text-xs font-bold tracking-tight text-white flex items-center gap-1.5">
+              <Sparkles className="w-3.5 h-3.5 text-indigo-400" />
+              Tackelo <span className="text-indigo-400">HUD</span>
+            </span>
+            <span
+              className={`text-[10px] font-mono px-1.5 py-0.5 rounded border ${
+                isListening
+                  ? 'bg-emerald-950/70 text-emerald-300 border-emerald-500/40'
+                  : 'bg-slate-800 text-slate-400 border-slate-700'
+              }`}
+            >
+              {isListening
+                ? isSpeakingDetected
+                  ? 'SPEAKING'
+                  : 'LIVE AUDIO'
+                : 'READY'}
+            </span>
+          </div>
+
+          <div className="flex items-center gap-1.5">
+            {!isInsideSeparateWindow && (
+              <button
+                type="button"
+                onClick={openSeparateAlwaysOnTopHud}
+                className="flex items-center gap-1 px-2 py-1 bg-indigo-600 hover:bg-indigo-500 text-white rounded text-[11px] font-semibold shadow"
+                title="Pop out into a separate Always-On-Top OS window so you can interact with other screens"
+              >
+                <ExternalLink className="w-3 h-3" />
+                <span>Always-On-Top Window</span>
+              </button>
+            )}
+            {!isInsideSeparateWindow && (
+              <button
+                type="button"
+                onClick={() => setIsHudMinimized(!isHudMinimized)}
+                className="p-1 text-slate-400 hover:text-white rounded hover:bg-slate-800"
+                title={isHudMinimized ? 'Expand HUD' : 'Minimize HUD'}
+              >
+                {isHudMinimized ? (
+                  <Maximize2 className="w-3.5 h-3.5" />
+                ) : (
+                  <Minimize2 className="w-3.5 h-3.5" />
+                )}
+              </button>
+            )}
+            <button
+              type="button"
+              onClick={closeFloatingHud}
+              className="px-2 py-1 bg-slate-800 hover:bg-rose-600 text-slate-200 hover:text-white rounded text-[11px] font-medium transition-colors"
+            >
+              Close
+            </button>
+          </div>
+        </div>
+
+        {!isHudMinimized && (
+          <>
+            {/* Transparency, Text Size & Audio Quick Controls */}
+            <div className="flex flex-wrap items-center justify-between gap-2 px-3.5 py-2 border-b border-slate-800/80 bg-slate-950/50 text-[11px]">
+              <div className="flex items-center gap-2">
+                <span className="text-slate-400">Glass:</span>
+                <input
+                  type="range"
+                  min="0.15"
+                  max="1.0"
+                  step="0.05"
+                  value={opacity}
+                  onChange={(e) => setOpacity(parseFloat(e.target.value))}
+                  className="w-20 accent-indigo-500"
+                  title="Adjust HUD transparency to see screens behind it"
+                />
+                <span className="font-mono text-indigo-300 w-8">
+                  {Math.round(opacity * 100)}%
+                </span>
+              </div>
+
+              <div className="flex items-center gap-1">
+                {(['sm', 'base', 'lg'] as const).map((sz) => (
+                  <button
+                    key={sz}
+                    type="button"
+                    onClick={() => setHudFontSize(sz)}
+                    className={`px-1.5 py-0.5 rounded font-mono text-[10px] ${
+                      hudFontSize === sz
+                        ? 'bg-indigo-600 text-white'
+                        : 'bg-slate-900 text-slate-400 hover:text-slate-200'
+                    }`}
+                  >
+                    {sz.toUpperCase()}
+                  </button>
+                ))}
+              </div>
+
+              <div className="flex items-center gap-1.5">
+                <button
+                  type="button"
+                  onClick={toggleListening}
+                  className={`px-2.5 py-1 rounded font-semibold text-[11px] ${
+                    isListening
+                      ? 'bg-rose-600 hover:bg-rose-500 text-white'
+                      : 'bg-indigo-600 hover:bg-indigo-500 text-white'
+                  }`}
+                >
+                  {isListening ? 'Stop Audio' : 'Capture Audio'}
+                </button>
+                {isListening && (
+                  <button
+                    type="button"
+                    onClick={flushCurrentUtteranceNow}
+                    className="px-2 py-1 bg-emerald-600 hover:bg-emerald-500 text-white rounded font-semibold text-[11px]"
+                  >
+                    Answer Now
+                  </button>
+                )}
+              </div>
+            </div>
+
+            {/* Quick Manual Question Input */}
+            <form
+              onSubmit={handleManualSubmit}
+              className="flex items-center gap-1.5 px-3.5 py-2 border-b border-slate-800/80"
+            >
+              <input
+                type="text"
+                placeholder="Type question or listen to incoming audio..."
+                value={manualInput}
+                onChange={(e) => setManualInput(e.target.value)}
+                className="flex-1 bg-slate-900/80 border border-slate-700/80 rounded-lg px-2.5 py-1.5 text-xs text-white placeholder-slate-400 focus:outline-none focus:border-indigo-500"
+              />
+              <button
+                type="submit"
+                className="px-3 py-1.5 bg-indigo-600 hover:bg-indigo-500 text-white rounded-lg text-xs font-semibold shrink-0"
+              >
+                Ask
+              </button>
+            </form>
+
+            {/* Live Streaming Spoken Answer Teleprompter */}
+            <div className="flex-1 overflow-y-auto p-3.5 flex flex-col gap-3 max-h-[380px]">
+              {transcriptLog.length === 0 ? (
+                <div className="py-8 text-center text-xs text-slate-300 flex flex-col items-center gap-2">
+                  <p className="font-semibold text-white">
+                    Floating Teleprompter Active
+                  </p>
+                  <p className="text-[11px] text-slate-400 max-w-xs">
+                    Interact freely with Zoom, Teams, Meet, or your coding window. Spoken answers stream here automatically.
+                  </p>
+                </div>
+              ) : (
+                transcriptLog.map((item) => (
+                  <div
+                    key={item.id}
+                    className="rounded-xl p-3.5 border border-indigo-500/30 flex flex-col gap-2"
+                    style={{ backgroundColor: `rgba(15, 23, 42, ${Math.min(0.92, opacity + 0.1)})` }}
+                  >
+                    <div className="flex items-center justify-between gap-2 border-b border-slate-800/80 pb-1.5">
+                      <span className="text-xs font-mono text-indigo-300 truncate">
+                        Q: &ldquo;{item.question}&rdquo;
+                      </span>
+                      <div className="flex items-center gap-1 shrink-0">
+                        <button
+                          type="button"
+                          onClick={() => copyToClipboard(item.spokenAnswer, item.id)}
+                          className="px-2 py-0.5 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded text-[10px]"
+                        >
+                          {copiedId === item.id ? 'Copied' : 'Copy'}
+                        </button>
+                        <button
+                          type="button"
+                          onClick={() => removeQuestionCard(item.id)}
+                          className="p-1 text-slate-400 hover:text-rose-400"
+                        >
+                          <Trash2 className="w-3 h-3" />
+                        </button>
+                      </div>
+                    </div>
+                    <p className={`${textSizeClass} text-white font-medium whitespace-pre-line`}>
+                      {item.spokenAnswer || (item.isStreaming ? '...' : '')}
+                    </p>
+                  </div>
+                ))
+              )}
+            </div>
+          </>
+        )}
+      </div>
+    );
+  };
+
   return (
-    <div
-      className={`min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans ${
-        isFloatingMode
-          ? 'fixed inset-0 z-50 overflow-auto bg-slate-950/95 backdrop-blur-xl'
-          : ''
-      }`}
-      style={{ opacity: isFloatingMode ? opacity : 1 }}
-    >
+    <div className="min-h-screen bg-slate-950 text-slate-100 flex flex-col font-sans">
       {/* Hidden active video sink required by Chromium so getDisplayMedia system/tab audio tracks are never suspended */}
       <video ref={hiddenVideoSinkRef} className="hidden" muted playsInline autoPlay />
 
-      {/* Top Bar Contract */}
-      <header className="flex items-center justify-between gap-8 px-6 py-4 border-b border-slate-800/80 bg-slate-900/60 backdrop-blur-md sticky top-0 z-40">
-        <div className="flex items-center gap-3">
-          <div className="w-9 h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-lg shadow-indigo-500/20">
-            <Sparkles className="w-5 h-5 text-white" />
+      {/* Hidden high-DPI canvas + video stream for Always-On-Top OS Picture-in-Picture HUD window */}
+      <canvas ref={hudCanvasRef} width={760} height={480} className="hidden" />
+      <video ref={hudVideoRef} className="hidden" muted playsInline />
+
+      {/* Portal into Separate Always-On-Top Document Picture-in-Picture Window */}
+      {pipContainer && createPortal(renderHudContent(true), pipContainer)}
+
+      {/* Non-blocking Click-Through Draggable Translucent HUD Overlay (user can freely click everything around it) */}
+      {isFloatingMode && !pipContainer && (
+        <div className="fixed inset-0 z-50 pointer-events-none">
+          <div
+            style={{ left: `${hudPosition.x}px`, top: `${hudPosition.y}px` }}
+            className="fixed w-[430px] max-w-[94vw] rounded-2xl border border-indigo-500/50 shadow-2xl overflow-hidden pointer-events-auto"
+          >
+            {renderHudContent(false)}
           </div>
-          <span className="text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0">
-            Tackelo <span className="text-indigo-400">AI</span>
-          </span>
+        </div>
+      )}
+
+      {/* Top Bar Contract */}
+      <header className="border-b border-slate-800/80 bg-slate-900/80 backdrop-blur-md sticky top-0 z-40">
+        <div className="flex items-center justify-between gap-3 px-4 md:px-6 py-3.5">
+          <div className="flex items-center gap-2.5">
+            <button
+              type="button"
+              onClick={() => setIsMobileMenuOpen(!isMobileMenuOpen)}
+              className="md:hidden p-2 text-slate-300 hover:text-white bg-slate-800/90 hover:bg-slate-700 rounded-lg border border-slate-700 transition-colors"
+              aria-label="Toggle navigation menu"
+            >
+              {isMobileMenuOpen ? <X className="w-5 h-5" /> : <Menu className="w-5 h-5" />}
+            </button>
+            <div className="w-8 h-8 md:w-9 md:h-9 rounded-xl bg-gradient-to-tr from-indigo-600 to-violet-500 flex items-center justify-center shadow-lg shadow-indigo-500/20 shrink-0">
+              <Sparkles className="w-4 h-4 md:w-5 md:h-5 text-white" />
+            </div>
+            <span className="text-base md:text-lg font-bold tracking-tight text-white whitespace-nowrap shrink-0">
+              Tackelo <span className="text-indigo-400">AI</span>
+            </span>
+          </div>
+
+          <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
+            <button
+              onClick={() => setActiveTab('setup')}
+              className={`transition-colors whitespace-nowrap shrink-0 pb-1 border-b-2 ${
+                activeTab === 'setup'
+                  ? 'text-white border-indigo-500'
+                  : 'border-transparent hover:text-slate-200'
+              }`}
+            >
+              1. Document Uploads
+            </button>
+            <button
+              onClick={() => setActiveTab('copilot')}
+              className={`transition-colors whitespace-nowrap shrink-0 pb-1 border-b-2 flex items-center gap-1.5 ${
+                activeTab === 'copilot'
+                  ? 'text-white border-indigo-500'
+                  : 'border-transparent hover:text-slate-200'
+              }`}
+            >
+              2. Live Spoken HUD
+              {transcriptLog.length > 0 && (
+                <span className="text-indigo-400 text-xs font-mono tabular-nums">
+                  ({transcriptLog.length})
+                </span>
+              )}
+            </button>
+            <button
+              onClick={() => setActiveTab('history')}
+              className={`transition-colors whitespace-nowrap shrink-0 pb-1 border-b-2 ${
+                activeTab === 'history'
+                  ? 'text-white border-indigo-500'
+                  : 'border-transparent hover:text-slate-200'
+              }`}
+            >
+              3. History & Export
+            </button>
+            <button
+              onClick={() => setActiveTab('settings')}
+              className={`transition-colors whitespace-nowrap shrink-0 pb-1 border-b-2 flex items-center gap-1.5 ${
+                activeTab === 'settings'
+                  ? 'text-white border-indigo-500'
+                  : 'border-transparent hover:text-slate-200'
+              }`}
+            >
+              <Settings className="w-3.5 h-3.5" />
+              <span>4. Settings & Models</span>
+            </button>
+          </nav>
+
+          <div className="flex items-center gap-2 md:gap-3 shrink-0">
+            <button
+              onClick={toggleFloatingHud}
+              className={`flex items-center gap-1.5 px-2.5 md:px-3 py-1.5 text-xs font-medium rounded-lg border transition-colors whitespace-nowrap ${
+                isFloatingMode || pipContainer || isVideoPipActive
+                  ? 'text-indigo-200 bg-indigo-950/80 border-indigo-500/60 hover:bg-indigo-900/70'
+                  : 'text-slate-300 bg-slate-800 hover:bg-slate-700 border-slate-700'
+              }`}
+              title="Pop out a translucent Always-On-Top Floating HUD window so you can interact with other screens"
+            >
+              {isFloatingMode || pipContainer || isVideoPipActive ? (
+                <EyeOff className="w-3.5 h-3.5 text-indigo-400" />
+              ) : (
+                <ExternalLink className="w-3.5 h-3.5 text-indigo-400" />
+              )}
+              <span className="hidden sm:inline">
+                {isFloatingMode || pipContainer || isVideoPipActive
+                  ? 'Close Floating HUD'
+                  : 'Pop-Out Floating HUD'}
+              </span>
+              <span className="sm:hidden">HUD</span>
+            </button>
+
+            {!isListening ? (
+              <button
+                onClick={toggleListening}
+                className="flex items-center gap-1.5 md:gap-2 px-3 md:px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg shadow-lg shadow-indigo-600/30 transition-all whitespace-nowrap"
+              >
+                <MonitorSpeaker className="w-4 h-4 shrink-0" />
+                <span className="hidden sm:inline">Capture Incoming Audio</span>
+                <span className="sm:hidden">Capture</span>
+              </button>
+            ) : (
+              <button
+                onClick={toggleListening}
+                className="flex items-center gap-1.5 md:gap-2 px-3 md:px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-lg shadow-lg shadow-rose-600/30 transition-all whitespace-nowrap"
+              >
+                <Square className="w-4 h-4 fill-current shrink-0" />
+                <span className="hidden sm:inline">Stop Audio Capture</span>
+                <span className="sm:hidden">Stop</span>
+              </button>
+            )}
+          </div>
         </div>
 
-        <nav className="hidden md:flex items-center gap-6 text-sm font-medium text-slate-400">
+        {/* Always-visible scrollable mobile tab strip (< md) */}
+        <nav className="flex md:hidden items-center gap-2 px-4 py-2 border-t border-slate-800/70 bg-slate-950/60 overflow-x-auto no-scrollbar text-xs font-medium">
           <button
-            onClick={() => setActiveTab('setup')}
-            className={`transition-colors whitespace-nowrap shrink-0 pb-1 border-b-2 ${
+            type="button"
+            onClick={() => {
+              setActiveTab('setup');
+              setIsMobileMenuOpen(false);
+            }}
+            className={`px-3 py-1.5 rounded-lg whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'setup'
-                ? 'text-white border-indigo-500'
-                : 'border-transparent hover:text-slate-200'
+                ? 'bg-indigo-600 text-white font-semibold'
+                : 'text-slate-300 bg-slate-900/80 hover:text-white'
             }`}
           >
             1. Document Uploads
           </button>
           <button
-            onClick={() => setActiveTab('copilot')}
-            className={`transition-colors whitespace-nowrap shrink-0 pb-1 border-b-2 flex items-center gap-1.5 ${
+            type="button"
+            onClick={() => {
+              setActiveTab('copilot');
+              setIsMobileMenuOpen(false);
+            }}
+            className={`px-3 py-1.5 rounded-lg whitespace-nowrap shrink-0 transition-colors flex items-center gap-1 ${
               activeTab === 'copilot'
-                ? 'text-white border-indigo-500'
-                : 'border-transparent hover:text-slate-200'
+                ? 'bg-indigo-600 text-white font-semibold'
+                : 'text-slate-300 bg-slate-900/80 hover:text-white'
             }`}
           >
-            2. Live Spoken HUD
+            <span>2. Live Spoken HUD</span>
             {transcriptLog.length > 0 && (
-              <span className="text-indigo-400 text-xs font-mono tabular-nums">
-                ({transcriptLog.length})
-              </span>
+              <span className="text-[11px] font-mono">({transcriptLog.length})</span>
             )}
           </button>
           <button
-            onClick={() => setActiveTab('history')}
-            className={`transition-colors whitespace-nowrap shrink-0 pb-1 border-b-2 ${
+            type="button"
+            onClick={() => {
+              setActiveTab('history');
+              setIsMobileMenuOpen(false);
+            }}
+            className={`px-3 py-1.5 rounded-lg whitespace-nowrap shrink-0 transition-colors ${
               activeTab === 'history'
-                ? 'text-white border-indigo-500'
-                : 'border-transparent hover:text-slate-200'
+                ? 'bg-indigo-600 text-white font-semibold'
+                : 'text-slate-300 bg-slate-900/80 hover:text-white'
             }`}
           >
             3. History & Export
           </button>
+          <button
+            type="button"
+            onClick={() => {
+              setActiveTab('settings');
+              setIsMobileMenuOpen(false);
+            }}
+            className={`px-3 py-1.5 rounded-lg whitespace-nowrap shrink-0 transition-colors flex items-center gap-1 ${
+              activeTab === 'settings'
+                ? 'bg-indigo-600 text-white font-semibold'
+                : 'text-slate-300 bg-slate-900/80 hover:text-white'
+            }`}
+          >
+            <Settings className="w-3 h-3" />
+            <span>4. Settings & Models</span>
+          </button>
         </nav>
 
-        <div className="flex items-center gap-3 shrink-0">
-          <button
-            onClick={() => setIsFloatingMode(!isFloatingMode)}
-            className="flex items-center gap-1.5 px-3 py-1.5 text-xs font-medium text-slate-300 bg-slate-800 hover:bg-slate-700 rounded-lg border border-slate-700 transition-colors whitespace-nowrap"
-          >
-            {isFloatingMode ? <EyeOff className="w-3.5 h-3.5" /> : <Eye className="w-3.5 h-3.5" />}
-            <span>{isFloatingMode ? 'Exit Floating HUD' : 'Floating HUD'}</span>
-          </button>
-
-          {!isListening ? (
+        {/* Expandable Mobile Menu Drawer when hamburger button is tapped */}
+        {isMobileMenuOpen && (
+          <div className="md:hidden border-t border-slate-800 bg-slate-900/95 px-4 py-3 flex flex-col gap-1.5 shadow-2xl">
             <button
-              onClick={toggleListening}
-              className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-indigo-600 hover:bg-indigo-500 rounded-lg shadow-lg shadow-indigo-600/30 transition-all whitespace-nowrap"
+              type="button"
+              onClick={() => {
+                setActiveTab('setup');
+                setIsMobileMenuOpen(false);
+              }}
+              className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-between ${
+                activeTab === 'setup'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-300 hover:bg-slate-800'
+              }`}
             >
-              <MonitorSpeaker className="w-4 h-4" />
-              <span>Capture Incoming Audio</span>
+              <span>1. Document Uploads (Resume · JD · Q&A)</span>
+              <ChevronRight className="w-4 h-4" />
             </button>
-          ) : (
             <button
-              onClick={toggleListening}
-              className="flex items-center gap-2 px-4 py-2 text-xs font-semibold text-white bg-rose-600 hover:bg-rose-500 rounded-lg shadow-lg shadow-rose-600/30 transition-all whitespace-nowrap"
+              type="button"
+              onClick={() => {
+                setActiveTab('copilot');
+                setIsMobileMenuOpen(false);
+              }}
+              className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-between ${
+                activeTab === 'copilot'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-300 hover:bg-slate-800'
+              }`}
             >
-              <Square className="w-4 h-4 fill-current" />
-              <span>Stop Audio Capture</span>
+              <span>
+                2. Live Spoken HUD {transcriptLog.length > 0 ? `(${transcriptLog.length})` : ''}
+              </span>
+              <ChevronRight className="w-4 h-4" />
             </button>
-          )}
-        </div>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('history');
+                setIsMobileMenuOpen(false);
+              }}
+              className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-between ${
+                activeTab === 'history'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              <span>3. History & Export Script</span>
+              <ChevronRight className="w-4 h-4" />
+            </button>
+            <button
+              type="button"
+              onClick={() => {
+                setActiveTab('settings');
+                setIsMobileMenuOpen(false);
+              }}
+              className={`w-full text-left px-3.5 py-2.5 rounded-xl text-xs font-semibold flex items-center justify-between ${
+                activeTab === 'settings'
+                  ? 'bg-indigo-600 text-white'
+                  : 'text-slate-300 hover:bg-slate-800'
+              }`}
+            >
+              <span className="flex items-center gap-2">
+                <Settings className="w-3.5 h-3.5" />
+                <span>4. Settings & Suggested Models</span>
+              </span>
+              <ChevronRight className="w-4 h-4" />
+            </button>
+          </div>
+        )}
       </header>
 
       {/* Main Content Area */}
       <main className="flex-1 max-w-5xl w-full mx-auto p-6 flex flex-col gap-6">
-        {isFloatingMode && (
-          <div className="bg-slate-900/90 border border-indigo-500/30 rounded-xl p-3 flex items-center justify-between shadow-2xl backdrop-blur-md">
-            <span className="text-xs font-semibold text-indigo-300">
-              Transparent Floating HUD Active
-            </span>
-            <div className="flex items-center gap-4 text-xs">
-              <label className="flex items-center gap-2 text-slate-400">
-                Opacity:
-                <input
-                  type="range"
-                  min="0.7"
-                  max="1.0"
-                  step="0.05"
-                  value={opacity}
-                  onChange={(e) => setOpacity(parseFloat(e.target.value))}
-                  className="w-24 accent-indigo-500"
-                />
-              </label>
-              <button
-                onClick={() => setIsFloatingMode(false)}
-                className="px-3 py-1 bg-slate-800 hover:bg-slate-700 text-slate-200 rounded-md border border-slate-700"
-              >
-                Dock
-              </button>
-            </div>
-          </div>
-        )}
 
         {uploadError && (
           <div className="bg-rose-950/50 border border-rose-500/40 rounded-xl p-3 text-xs text-rose-300 flex items-center justify-between">
@@ -1626,6 +2469,246 @@ export default function App() {
                 ))}
               </div>
             )}
+          </div>
+        )}
+
+        {/* Tab 4: Settings & Suggested Models */}
+        {activeTab === 'settings' && (
+          <div className="flex flex-col gap-6">
+            {/* Suggested Answer Generation Models */}
+            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-4">
+              <div className="flex flex-wrap items-center justify-between gap-2">
+                <div className="flex items-center gap-2.5">
+                  <Cpu className="w-5 h-5 text-indigo-400" />
+                  <div>
+                    <h2 className="text-base font-bold text-white">
+                      Suggested Answer Generation Models
+                    </h2>
+                    <p className="text-xs text-slate-400">
+                      Select the primary Gemini model used to stream first-person interview answers from your Resume, JD, and Prepared Q&amp;A.
+                    </p>
+                  </div>
+                </div>
+                {settingsSavedMsg && (
+                  <span className="text-xs text-emerald-400 font-medium flex items-center gap-1">
+                    <CheckCircle2 className="w-3.5 h-3.5" />
+                    {settingsSavedMsg}
+                  </span>
+                )}
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-2 gap-4">
+                {SUGGESTED_ANSWER_MODELS.map((model) => {
+                  const isSelected = answerModel === model.id;
+                  return (
+                    <button
+                      key={model.id}
+                      type="button"
+                      onClick={() => {
+                        setAnswerModel(model.id);
+                        saveAppSettings({ answerModel: model.id });
+                      }}
+                      className={`text-left p-4 rounded-xl border transition-all flex flex-col justify-between gap-3 ${
+                        isSelected
+                          ? 'bg-indigo-950/40 border-indigo-500 shadow-lg shadow-indigo-500/10'
+                          : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-bold text-white">{model.name}</span>
+                          <span
+                            className={`text-[11px] font-mono px-2 py-0.5 rounded-md border ${
+                              model.recommended
+                                ? 'bg-emerald-950/60 text-emerald-300 border-emerald-500/40'
+                                : 'bg-slate-900 text-indigo-300 border-slate-700'
+                            }`}
+                          >
+                            {model.badge}
+                          </span>
+                        </div>
+                        <span className="text-[11px] font-mono text-slate-400">{model.id}</span>
+                        <p className="text-xs text-slate-300 leading-relaxed mt-1">
+                          {model.description}
+                        </p>
+                      </div>
+                      <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400">
+                        <strong className="text-slate-200">Best for:</strong> {model.bestFor}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Suggested Audio Transcription Models */}
+            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-4">
+              <div className="flex items-center gap-2.5">
+                <MonitorSpeaker className="w-5 h-5 text-indigo-400" />
+                <div>
+                  <h2 className="text-base font-bold text-white">
+                    Suggested Incoming Audio Transcription Models
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Select the model used to transcribe incoming interviewer voice questions from Zoom, Teams, or Google Meet.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-4">
+                {SUGGESTED_AUDIO_MODELS.map((model) => {
+                  const isSelected = audioModel === model.id;
+                  return (
+                    <button
+                      key={model.id}
+                      type="button"
+                      onClick={() => {
+                        setAudioModel(model.id);
+                        saveAppSettings({ audioModel: model.id });
+                      }}
+                      className={`text-left p-4 rounded-xl border transition-all flex flex-col justify-between gap-3 ${
+                        isSelected
+                          ? 'bg-indigo-950/40 border-indigo-500 shadow-lg shadow-indigo-500/10'
+                          : 'bg-slate-950/60 border-slate-800 hover:border-slate-700'
+                      }`}
+                    >
+                      <div className="flex flex-col gap-1.5">
+                        <div className="flex items-center justify-between gap-2">
+                          <span className="text-sm font-bold text-white">{model.name}</span>
+                        </div>
+                        <span
+                          className={`text-[11px] font-mono w-fit px-2 py-0.5 rounded-md border ${
+                            model.recommended
+                              ? 'bg-emerald-950/60 text-emerald-300 border-emerald-500/40'
+                              : 'bg-slate-900 text-indigo-300 border-slate-700'
+                          }`}
+                        >
+                          {model.badge}
+                        </span>
+                        <span className="text-[11px] font-mono text-slate-400">{model.id}</span>
+                        <p className="text-xs text-slate-300 leading-relaxed mt-1">
+                          {model.description}
+                        </p>
+                      </div>
+                      <div className="pt-2 border-t border-slate-800/80 text-[11px] text-slate-400">
+                        <strong className="text-slate-200">Best for:</strong> {model.bestFor}
+                      </div>
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+
+            {/* Streaming & Response Behavior Configuration */}
+            <div className="bg-slate-900/60 border border-slate-800 rounded-2xl p-6 shadow-xl flex flex-col gap-5">
+              <div className="flex items-center gap-2.5">
+                <Sliders className="w-5 h-5 text-indigo-400" />
+                <div>
+                  <h2 className="text-base font-bold text-white">
+                    Application &amp; Streaming Configurations
+                  </h2>
+                  <p className="text-xs text-slate-400">
+                    Fine-tune response pacing, reasoning latency, temperature, and automatic model rotation.
+                  </p>
+                </div>
+              </div>
+
+              <div className="grid grid-cols-1 md:grid-cols-3 gap-6">
+                {/* Spoken Answer Format */}
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-col gap-2">
+                  <label className="text-xs font-semibold text-white">
+                    Spoken Answer Style
+                  </label>
+                  <select
+                    value={answerStyle}
+                    onChange={(e) => {
+                      const val = e.target.value as 'concise' | 'balanced' | 'star';
+                      setAnswerStyle(val);
+                      saveAppSettings({ answerStyle: val });
+                    }}
+                    className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
+                  >
+                    <option value="concise">Concise (30–45s Quick Spoken Script)</option>
+                    <option value="balanced">Balanced (60s Natural Interview Script)</option>
+                    <option value="star">STAR Method (Situation · Task · Action · Result)</option>
+                  </select>
+                  <span className="text-[11px] text-slate-400">
+                    Controls how long and structured your first-person spoken answers are.
+                  </span>
+                </div>
+
+                {/* Reasoning / Latency Mode */}
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-col gap-2">
+                  <label className="text-xs font-semibold text-white">
+                    Reasoning &amp; Streaming Latency
+                  </label>
+                  <select
+                    value={thinkingLevel}
+                    onChange={(e) => {
+                      const val = e.target.value as 'MINIMAL' | 'LOW' | 'MEDIUM';
+                      setThinkingLevel(val);
+                      saveAppSettings({ thinkingLevel: val });
+                    }}
+                    className="bg-slate-900 border border-slate-700 rounded-lg px-3 py-2 text-xs text-slate-200"
+                  >
+                    <option value="MINIMAL">Minimal Thinking (Instant First Token)</option>
+                    <option value="LOW">Low Thinking (Fast + Extra Accuracy)</option>
+                    <option value="MEDIUM">Medium Thinking (Deep System Design)</option>
+                  </select>
+                  <span className="text-[11px] text-slate-400">
+                    Minimal starts streaming answers immediately after the interviewer finishes speaking.
+                  </span>
+                </div>
+
+                {/* Temperature */}
+                <div className="bg-slate-950 border border-slate-800 rounded-xl p-4 flex flex-col gap-2">
+                  <div className="flex items-center justify-between">
+                    <label className="text-xs font-semibold text-white">
+                      Response Temperature
+                    </label>
+                    <span className="text-xs font-mono text-indigo-400">{temperature.toFixed(1)}</span>
+                  </div>
+                  <input
+                    type="range"
+                    min="0.0"
+                    max="1.0"
+                    step="0.1"
+                    value={temperature}
+                    onChange={(e) => {
+                      const val = parseFloat(e.target.value);
+                      setTemperature(val);
+                      saveAppSettings({ temperature: val });
+                    }}
+                    className="w-full accent-indigo-500 mt-1"
+                  />
+                  <span className="text-[11px] text-slate-400">
+                    Recommended: 0.3 for grounded, factual answers strictly faithful to your Resume &amp; RAG docs.
+                  </span>
+                </div>
+              </div>
+
+              <div className="flex flex-wrap items-center justify-between gap-4 pt-3 border-t border-slate-800">
+                <label className="flex items-center gap-2.5 text-xs text-slate-200 cursor-pointer">
+                  <input
+                    type="checkbox"
+                    checked={autoFallback}
+                    onChange={(e) => {
+                      const checked = e.target.checked;
+                      setAutoFallback(checked);
+                      saveAppSettings({ autoFallback: checked });
+                    }}
+                    className="rounded accent-indigo-500"
+                  />
+                  <span>
+                    <strong>Automatic Multi-Model Quota Rotation:</strong> Automatically rotate across backup Gemini models and local RAG synthesis if the primary model hits a rate limit.
+                  </span>
+                </label>
+
+                <span className="text-[11px] text-slate-400 font-mono">
+                  Environment variables &amp; secrets are managed in the Settings &gt; Secrets panel.
+                </span>
+              </div>
+            </div>
           </div>
         )}
       </main>
